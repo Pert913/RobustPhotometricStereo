@@ -9,16 +9,17 @@ import psutil
 METHOD = RPS.L2_SOLVER    # Least-squares
 #METHOD = RPS.L1_SOLVER_MULTICORE    # L1 residual minimization
 #METHOD = RPS.SBL_SOLVER_MULTICORE    # Sparse Bayesian Learning
-#METHOD = RPS.RPCA_SOLVER    # Robust PCA
+# METHOD = RPS.RPCA_SOLVER    # Robust PCA
 
 # Choose a dataset
 #DATA_FOLDERNAME = './data/bunny/bunny_specular/'    # Specular with cast shadow
-DATA_FOLDERNAME = './data/bunny/bunny_lambert/'    # Lambertian diffuse with cast shadow
-#DATA_FOLDERNAME = './data/bunny/bunny_lambert_noshadow/'    # Lambertian diffuse without cast shadow
+# DATA_FOLDERNAME = './data/bunny/bunny_lambert/'    # Lambertian diffuse with cast shadow
+# DATA_FOLDERNAME = './data/bunny/bunny_lambert_noshadow/'    # Lambertian diffuse without cast shadow
+DATA_FOLDERNAME = './data/buddha/buddhaPNG_npy/'
 
-LIGHT_FILENAME = './data/bunny/lights.npy'
-MASK_FILENAME = './data/bunny/mask.png'
-GT_NORMAL_FILENAME = './data/bunny/gt_normal.npy'
+LIGHT_FILENAME = './data/buddha/light_directions.npy'
+MASK_FILENAME = './data/buddha/mask.png'
+GT_NORMAL_FILENAME = './data/buddha/normal.npy'
 
 
 # Photometric Stereo
