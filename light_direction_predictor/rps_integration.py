@@ -6,7 +6,7 @@ This script demonstrates the complete workflow:
 2. Predict light directions for your own images
 3. Run RPS to get surface normals
 
-Updated for V2 LightDirectionPredictor with RF model.
+Updated for LightDirectionPredictor with RF model.
 """
 
 from __future__ import print_function
@@ -16,14 +16,9 @@ import sys
 import time
 import glob
 
-# Add parent directory to path (to import rps, psutil from project root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-# Import your existing RPS modules
 from rps import RPS
 import psutil
-
-# Import the light predictor (same folder)
 from light_direction_predictor import LightDirectionPredictor
 
 
@@ -72,14 +67,11 @@ def predict_light_directions(predictor, images_folder, output_txt_path):
     print("\n" + "=" * 60)
     print("STEP 2: Predicting Light Directions")
     print("=" * 60)
-
     light_dirs = predictor.predict_from_folder(images_folder, output_txt_path)
-
     print(f"\nPredicted {len(light_dirs)} light directions")
     print(f"Sample predictions (first 5):")
     for i in range(min(5, len(light_dirs))):
         print(f"  Image {i + 1}: [{light_dirs[i, 0]:.4f}, {light_dirs[i, 1]:.4f}, {light_dirs[i, 2]:.4f}]")
-
     return light_dirs
 
 
@@ -165,21 +157,19 @@ def full_pipeline_with_training():
     """
     Full pipeline: Train predictor, predict lights, run RPS.
     """
-    # === CONFIGURATION ===
-    # Paths relative to project root
     BASE_DIR = os.path.join(os.path.dirname(__file__), '..')
 
     TRAINING_FOLDER = os.path.join(BASE_DIR, 'data/training/')
     MODEL_PATH = os.path.join(os.path.dirname(__file__), 'light_predictor_v2.pkl')
     MODEL_TYPE = 'rf'  # Best performing model
 
-    # Your new images (to process)
-    NEW_IMAGES_FOLDER = os.path.join(BASE_DIR, 'data/my_object/images/')
-    MASK_PATH = os.path.join(BASE_DIR, 'data/my_object/mask.png')
+
+    NEW_IMAGES_FOLDER = os.path.join(BASE_DIR, 'data/tue_test/images/')
+    MASK_PATH = os.path.join(BASE_DIR, 'data/tue_test/mask.png')
 
     # Outputs
-    PREDICTED_LIGHTS_PATH = os.path.join(BASE_DIR, 'data/my_object/predicted_light_directions.txt')
-    OUTPUT_NORMAL_PATH = os.path.join(BASE_DIR, 'data/my_object/estimated_normal')
+    PREDICTED_LIGHTS_PATH = os.path.join(BASE_DIR, 'data/tue_test/predicted_light_directions.txt')
+    OUTPUT_NORMAL_PATH = os.path.join(BASE_DIR, 'data/tue_test/estimated_normal')
 
     RPS_METHOD = RPS.L2_SOLVER
 
