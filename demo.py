@@ -16,16 +16,19 @@ METHOD = RPS.L2_SOLVER    # Least-squares
 # DATA_FOLDERNAME = './data/bunny/bunny_lambert/'    # Lambertian diffuse with cast shadow
 # DATA_FOLDERNAME = './data/bunny/bunny_lambert_noshadow/'    # Lambertian diffuse without cast shadow
 
-"""
 DATA_FOLDERNAME = './data/buddha/buddhaPNG_npy/'
+DATA_FOLDERNAME_IMG = './data/buddha/buddhaPNG/'
 LIGHT_FILENAME = './data/buddha/light_directions.npy'
+LIGHT_FILENAME_TXT = './data/buddha/light_directions.txt'
 MASK_FILENAME = './data/buddha/mask.png'
-"""
 
+
+"""
 DATA_FOLDERNAME = './data/cat/catPNG_npy/'
 LIGHT_FILENAME = 'data/cat/light_directions.npy'
 LIGHT_FILENAME_TXT = './data/cat/light_directions.txt'
 MASK_FILENAME = './data/cat/mask.png'
+"""
 
 
 # GT_NORMAL_FILENAME = './data/budda/normal.npy'

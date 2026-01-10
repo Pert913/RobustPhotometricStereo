@@ -164,12 +164,12 @@ def full_pipeline_with_training():
     MODEL_TYPE = 'rf'  # Best performing model
 
 
-    NEW_IMAGES_FOLDER = os.path.join(BASE_DIR, 'data/tue_test/images/')
-    MASK_PATH = os.path.join(BASE_DIR, 'data/tue_test/mask.png')
+    NEW_IMAGES_FOLDER = os.path.join(BASE_DIR, 'data/testing/images/')
+    MASK_PATH = os.path.join(BASE_DIR, 'data/testing/mask.png')
 
     # Outputs
-    PREDICTED_LIGHTS_PATH = os.path.join(BASE_DIR, 'data/tue_test/predicted_light_directions.txt')
-    OUTPUT_NORMAL_PATH = os.path.join(BASE_DIR, 'data/tue_test/estimated_normal')
+    PREDICTED_LIGHTS_PATH = os.path.join(BASE_DIR, 'data/testing/predicted_light_directions.txt')
+    OUTPUT_NORMAL_PATH = os.path.join(BASE_DIR, 'data/testing/estimated_normal')
 
     RPS_METHOD = RPS.L2_SOLVER
 
@@ -202,6 +202,9 @@ def full_pipeline_with_training():
     print("PIPELINE COMPLETE!")
     print("=" * 60)
 
+# TODO: Assinged to Tue
+def quick_test_on_real_images(test_object="pikachuPNG", test_folder="testing"):
+    pass
 
 def quick_test_on_training_data(test_object='buddhaPNG'):
     """
@@ -217,7 +220,7 @@ def quick_test_on_training_data(test_object='buddhaPNG'):
 
     # Paths relative to project root
     BASE_DIR = os.path.join(os.path.dirname(__file__), '..')
-    TRAINING_FOLDER = os.path.join(BASE_DIR, 'data/training/')
+    TRAINING_FOLDER = os.path.join(os.path.dirname(__file__), 'data/training/')
 
     # Model could be in script dir or project root
     MODEL_PATH_LOCAL = os.path.join(os.path.dirname(__file__), 'light_predictor_v2.pkl')
@@ -250,6 +253,7 @@ def quick_test_on_training_data(test_object='buddhaPNG'):
 
     # Predict
     predicted_lights = predictor.predict_from_folder(test_folder, pred_lights_path)
+    #predicted_lights = predictor.predict_from_folder(test_folder, gt_lights_path)
 
     # Compare with ground truth
     gt_lights = np.loadtxt(gt_lights_path)
@@ -267,7 +271,7 @@ def quick_test_on_training_data(test_object='buddhaPNG'):
 
     # Now run RPS with predicted lights and compare normals
     print("\n--- Running RPS with Predicted Lights ---")
-    mask_path = os.path.join(test_folder, 'mask.png')
+    mask_path = os.path.join(test_folder, '/metadata/mask.png')
 
     rps_pred = run_rps_pipeline(
         images_folder=test_folder + '/',
