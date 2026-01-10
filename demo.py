@@ -15,17 +15,30 @@ METHOD = RPS.L2_SOLVER    # Least-squares
 #DATA_FOLDERNAME = './data/bunny/bunny_specular/'    # Specular with cast shadow
 # DATA_FOLDERNAME = './data/bunny/bunny_lambert/'    # Lambertian diffuse with cast shadow
 # DATA_FOLDERNAME = './data/bunny/bunny_lambert_noshadow/'    # Lambertian diffuse without cast shadow
+
 DATA_FOLDERNAME = './data/buddha/buddhaPNG_npy/'
-
+DATA_FOLDERNAME_IMG = './data/buddha/buddhaPNG/'
 LIGHT_FILENAME = './data/buddha/light_directions.npy'
+LIGHT_FILENAME_TXT = './data/buddha/light_directions.txt'
 MASK_FILENAME = './data/buddha/mask.png'
-GT_NORMAL_FILENAME = './data/buddha/normal.npy'
 
+
+"""
+DATA_FOLDERNAME = './data/cat/catPNG_npy/'
+LIGHT_FILENAME = 'data/cat/light_directions.npy'
+LIGHT_FILENAME_TXT = './data/cat/light_directions.txt'
+MASK_FILENAME = './data/cat/mask.png'
+"""
+
+
+# GT_NORMAL_FILENAME = './data/budda/normal.npy'
+GT_NORMAL_FILENAME = './est_normal.npy'
 
 # Photometric Stereo
 rps = RPS()
 rps.load_mask(filename=MASK_FILENAME)    # Load mask image
-rps.load_lightnpy(filename=LIGHT_FILENAME)    # Load light matrix
+#rps.load_lightnpy(filename=LIGHT_FILENAME)    # Load light matrix
+rps.load_lighttxt(filename=LIGHT_FILENAME_TXT)
 rps.load_npyimages(foldername=DATA_FOLDERNAME)    # Load observations
 start = time.time()
 rps.solve(METHOD)    # Compute
