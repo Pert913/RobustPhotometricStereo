@@ -79,7 +79,7 @@ class LightDirectionPredictor:
         grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
 
         # Gradient direction histogram (8 bins, 0-360°)
-        grad_angle = np.arctan2(grad_y, grad_x)  # -π to π
+        grad_angle = np.arctan2(grad_y, grad_x)  # -3.14 to 3.14
         angle_bins = np.linspace(-np.pi, np.pi, 9)
         hist, _ = np.histogram(grad_angle, bins=angle_bins, weights=grad_mag)
         hist = hist / (hist.sum() + 1e-8)  # Normalize
