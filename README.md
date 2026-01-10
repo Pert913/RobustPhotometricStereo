@@ -1,4 +1,4 @@
-# Robust Photometric Stereo in Python
+# Robust Photometric Stereo in Python 3.13
 
 written by Yasuyuki Matsushita (yasumat@ist.osaka-u.ac.jp) supported 
 by Osaka University and JSPS KAKENHI Grant Number JP16H01732, Japan
