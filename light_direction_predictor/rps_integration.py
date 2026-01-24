@@ -203,8 +203,118 @@ def full_pipeline_with_training():
     print("=" * 60)
 
 # TODO: Assinged to Tue
-def quick_test_on_real_images(test_object="pikachuPNG", test_folder="testing"):
-    pass
+def quick_test_on_real_images(test_object="bootaoPNG", test_folder="testing"):
+    """
+    Quick test: Use predictor on one of the real objects
+
+    Args:
+        test_object: Name of object folder to test (e.g., 'buddhaPNG', 'catPNG')
+    """
+    print("\n" + "=" * 60)
+    print(f"QUICK TEST: Verify Pipeline on {test_object}")
+    print("=" * 60)
+
+    # Paths relative to project root
+    BASE_DIR = os.path.join(os.path.dirname(__file__), '..')
+    TESTING_FOLDER = os.path.join(os.path.dirname(__file__), 'data/testing/')
+
+    # Model could be in script dir or project root
+    MODEL_PATH_LOCAL = os.path.join(os.path.dirname(__file__), 'light_predictor_v2.pkl')
+    MODEL_PATH_ROOT = os.path.join(BASE_DIR, 'light_predictor_v2.pkl')
+
+    # Check which one exists
+    if os.path.exists(MODEL_PATH_LOCAL):
+        MODEL_PATH = MODEL_PATH_LOCAL
+    elif os.path.exists(MODEL_PATH_ROOT):
+        MODEL_PATH = MODEL_PATH_ROOT
+    else:
+        print(f"Model not found at:")
+        print(f"  - {MODEL_PATH_LOCAL}")
+        print(f"  - {MODEL_PATH_ROOT}")
+        print("Please run light_direction_predictor.py first to train the model.")
+        return
+
+    predictor = LightDirectionPredictor()
+    predictor.load(MODEL_PATH)
+
+    # Test on specified object
+    test_folder = os.path.join(TESTING_FOLDER, test_object)
+
+    if not os.path.exists(test_folder):
+        print(f"Test folder not found: {test_folder}")
+        return
+
+    gt_lights_path = os.path.join(test_folder, 'light_directions.txt')
+    pred_lights_path = os.path.join(test_folder, 'predicted_light_directions.txt')
+
+    # # Predict
+    predicted_lights = predictor.predict_from_folder(test_folder, pred_lights_path)
+    # #predicted_lights = predictor.predict_from_folder(test_folder, gt_lights_path)
+
+    # # Compare with ground truth
+    # gt_lights = np.loadtxt(gt_lights_path)
+
+    # # Angular error between predicted and GT light directions
+    # cos_sim = np.sum(gt_lights * predicted_lights, axis=1)
+    # cos_sim = np.clip(cos_sim, -1, 1)
+    # light_errors = np.arccos(cos_sim) * 180 / np.pi
+
+    # print(f"\nLight Direction Prediction Errors for {test_object}:")
+    # print(f"  Mean: {light_errors.mean():.2f}°")
+    # print(f"  Std:  {light_errors.std():.2f}°")
+    # print(f"  Min:  {light_errors.min():.2f}°")
+    # print(f"  Max:  {light_errors.max():.2f}°")
+
+    # Now run RPS with predicted lights and compare normals
+    print("\n--- Running RPS with Predicted Lights ---")
+    mask_path = os.path.join(test_folder, '/metadata/mask.png')
+
+    rps_pred = run_rps_pipeline(
+        images_folder=test_folder + '/',
+        light_txt_path=pred_lights_path,
+        mask_path=mask_path if os.path.exists(mask_path) else None,
+        output_normal_path=os.path.join(BASE_DIR, 'test_normal_predicted'),
+        method=RPS.L2_SOLVER
+    )
+
+    # print("\n--- Running RPS with Ground Truth Lights ---")
+    # rps_gt = run_rps_pipeline(
+    #     images_folder=test_folder + '/',
+    #     light_txt_path=gt_lights_path,
+    #     mask_path=mask_path if os.path.exists(mask_path) else None,
+    #     output_normal_path=os.path.join(BASE_DIR, 'test_normal_gt'),
+    #     method=RPS.L2_SOLVER
+    # )
+
+    # # Compare normal maps
+    # normal_cos_sim = np.sum(rps_gt.N * rps_pred.N, axis=1)
+    # normal_cos_sim = np.clip(normal_cos_sim, -1, 1)
+    # normal_errors = np.arccos(normal_cos_sim) * 180 / np.pi
+
+    # if rps_pred.background_ind is not None:
+    #     normal_errors[rps_pred.background_ind] = 0
+    #     foreground_mask = np.ones(len(normal_errors), dtype=bool)
+    #     foreground_mask[rps_pred.background_ind] = False
+    #     mean_normal_err = normal_errors[foreground_mask].mean()
+    # else:
+    #     mean_normal_err = normal_errors.mean()
+
+    # print(f"\n{'=' * 50}")
+    # print("RESULTS SUMMARY")
+    # print('=' * 50)
+    # print(f"Object tested:        {test_object}")
+    # print(f"Light direction error: {light_errors.mean():.2f}°")
+    # print(f"Normal map error:      {mean_normal_err:.2f}°")
+    # print('=' * 50)
+
+    print("\nDisplaying predicted normal map...")
+    rps_pred.disp_normalmap()
+
+    return {
+        'object': test_object,
+        'light_error': light_errors.mean(),
+        'normal_error': mean_normal_err
+    }
 
 def quick_test_on_training_data(test_object='buddhaPNG'):
     """
@@ -374,7 +484,8 @@ if __name__ == '__main__':
     # Choose which to run:
 
     # Option 1: Quick test on single object
-    quick_test_on_training_data('buddhaPNG')
+    # quick_test_on_training_data('buddhaPNG')
+    quick_test_on_real_images('dimooPNG')
 
     # Option 2: Test all objects (comprehensive)
     # test_all_objects()
