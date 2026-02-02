@@ -18,7 +18,7 @@ import glob
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from rps import RPS
-import psutil
+import ps_utils
 from light_direction_predictor import LightDirectionPredictor
 
 
@@ -136,10 +136,10 @@ def evaluate_results(rps, gt_normal_path=None):
     print("=" * 60)
 
     if gt_normal_path and os.path.exists(gt_normal_path):
-        N_gt = psutil.load_normalmap_from_npy(filename=gt_normal_path)
+        N_gt = ps_utils.load_normalmap_from_npy(filename=gt_normal_path)
         N_gt = np.reshape(N_gt, (rps.height * rps.width, 3))
 
-        angular_err = psutil.evaluate_angular_error(N_gt, rps.N, rps.background_ind)
+        angular_err = ps_utils.evaluate_angular_error(N_gt, rps.N, rps.background_ind)
         mean_err = np.mean(angular_err)
 
         print(f"Mean Angular Error: {mean_err:.2f} degrees")
@@ -148,7 +148,7 @@ def evaluate_results(rps, gt_normal_path=None):
 
     # Display normal map
     print("Displaying normal map (press any key to close)...")
-    psutil.disp_normalmap(normal=rps.N, height=rps.height, width=rps.width)
+    ps_utils.disp_normalmap(normal=rps.N, height=rps.height, width=rps.width)
 
 
 # ==================== COMPLETE PIPELINE ====================
@@ -160,7 +160,10 @@ def full_pipeline_with_training():
     BASE_DIR = os.path.join(os.path.dirname(__file__), '..')
 
     TRAINING_FOLDER = os.path.join(BASE_DIR, 'data/training/')
-    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'light_predictor_v2.pkl')
+    # Using ML model
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'light_predictor_ml_v3.pkl')
+    # Using DL model
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), 'light_predictor_dl_v3.pkl')
     MODEL_TYPE = 'rf'  # Best performing model
 
 
@@ -249,21 +252,20 @@ def quick_test_on_real_images(test_object="bootaoPNG", test_folder="testing"):
 
     # # Predict
     predicted_lights = predictor.predict_from_folder(test_folder, pred_lights_path)
-    # #predicted_lights = predictor.predict_from_folder(test_folder, gt_lights_path)
 
-    # # Compare with ground truth
-    # gt_lights = np.loadtxt(gt_lights_path)
+    # Compare with ground truth
+    gt_lights = np.loadtxt(gt_lights_path)
 
-    # # Angular error between predicted and GT light directions
-    # cos_sim = np.sum(gt_lights * predicted_lights, axis=1)
-    # cos_sim = np.clip(cos_sim, -1, 1)
-    # light_errors = np.arccos(cos_sim) * 180 / np.pi
+    # Angular error between predicted and GT light directions
+    cos_sim = np.sum(gt_lights * predicted_lights, axis=1)
+    cos_sim = np.clip(cos_sim, -1, 1)
+    light_errors = np.arccos(cos_sim) * 180 / np.pi
 
-    # print(f"\nLight Direction Prediction Errors for {test_object}:")
-    # print(f"  Mean: {light_errors.mean():.2f}°")
-    # print(f"  Std:  {light_errors.std():.2f}°")
-    # print(f"  Min:  {light_errors.min():.2f}°")
-    # print(f"  Max:  {light_errors.max():.2f}°")
+    print(f"\nLight Direction Prediction Errors for {test_object}:")
+    print(f"  Mean: {light_errors.mean():.2f}°")
+    print(f"  Std:  {light_errors.std():.2f}°")
+    print(f"  Min:  {light_errors.min():.2f}°")
+    print(f"  Max:  {light_errors.max():.2f}°")
 
     # Now run RPS with predicted lights and compare normals
     print("\n--- Running RPS with Predicted Lights ---")
@@ -277,35 +279,35 @@ def quick_test_on_real_images(test_object="bootaoPNG", test_folder="testing"):
         method=RPS.L2_SOLVER
     )
 
-    # print("\n--- Running RPS with Ground Truth Lights ---")
-    # rps_gt = run_rps_pipeline(
-    #     images_folder=test_folder + '/',
-    #     light_txt_path=gt_lights_path,
-    #     mask_path=mask_path if os.path.exists(mask_path) else None,
-    #     output_normal_path=os.path.join(BASE_DIR, 'test_normal_gt'),
-    #     method=RPS.L2_SOLVER
-    # )
+    print("\n--- Running RPS with Ground Truth Lights ---")
+    rps_gt = run_rps_pipeline(
+        images_folder=test_folder + '/',
+         light_txt_path=gt_lights_path,
+         mask_path=mask_path if os.path.exists(mask_path) else None,
+         output_normal_path=os.path.join(BASE_DIR, 'test_normal_gt'),
+         method=RPS.L2_SOLVER
+    )
 
-    # # Compare normal maps
-    # normal_cos_sim = np.sum(rps_gt.N * rps_pred.N, axis=1)
-    # normal_cos_sim = np.clip(normal_cos_sim, -1, 1)
-    # normal_errors = np.arccos(normal_cos_sim) * 180 / np.pi
+    # Compare normal maps
+    normal_cos_sim = np.sum(rps_gt.N * rps_pred.N, axis=1)
+    normal_cos_sim = np.clip(normal_cos_sim, -1, 1)
+    normal_errors = np.arccos(normal_cos_sim) * 180 / np.pi
 
-    # if rps_pred.background_ind is not None:
-    #     normal_errors[rps_pred.background_ind] = 0
-    #     foreground_mask = np.ones(len(normal_errors), dtype=bool)
-    #     foreground_mask[rps_pred.background_ind] = False
-    #     mean_normal_err = normal_errors[foreground_mask].mean()
-    # else:
-    #     mean_normal_err = normal_errors.mean()
+    if rps_pred.background_ind is not None:
+         normal_errors[rps_pred.background_ind] = 0
+         foreground_mask = np.ones(len(normal_errors), dtype=bool)
+         foreground_mask[rps_pred.background_ind] = False
+         mean_normal_err = normal_errors[foreground_mask].mean()
+    else:
+         mean_normal_err = normal_errors.mean()
 
-    # print(f"\n{'=' * 50}")
-    # print("RESULTS SUMMARY")
-    # print('=' * 50)
-    # print(f"Object tested:        {test_object}")
-    # print(f"Light direction error: {light_errors.mean():.2f}°")
-    # print(f"Normal map error:      {mean_normal_err:.2f}°")
-    # print('=' * 50)
+    print(f"\n{'=' * 50}")
+    print("RESULTS SUMMARY")
+    print('=' * 50)
+    print(f"Object tested:        {test_object}")
+    print(f"Light direction error: {light_errors.mean():.2f}°")
+    print(f"Normal map error:      {mean_normal_err:.2f}°")
+    print('=' * 50)
 
     print("\nDisplaying predicted normal map...")
     rps_pred.disp_normalmap()
@@ -469,13 +471,13 @@ def test_all_objects():
         print("QUALITY ASSESSMENT")
         print("=" * 60)
         if avg_normal < 10:
-            print("✅ EXCELLENT: Normal maps are highly accurate")
+            print("EXCELLENT: Normal maps are highly accurate")
         elif avg_normal < 15:
-            print("✅ GOOD: Normal maps are usable with minor artifacts")
+            print("GOOD: Normal maps are usable with minor artifacts")
         elif avg_normal < 25:
-            print("⚠️ FAIR: Normal maps show visible errors but structure preserved")
+            print("FAIR: Normal maps show visible errors but structure preserved")
         else:
-            print("❌ POOR: Normal maps have significant errors")
+            print("POOR: Normal maps have significant errors")
 
     return results
 
