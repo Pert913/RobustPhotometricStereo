@@ -1,8 +1,10 @@
 # Comprehensive Codebase Analysis: RobustPhotometricStereo
 
-A state-of-the-art robust photometric stereo implementation with multiple solver algorithms and an ML-based light direction predictor.
+A state-of-the-art robust photometric stereo implementation with multiple solver algorithms and an ML/DL-based light direction predictor.
 
-**Total Lines of Code:** ~1,654 lines (excluding dependencies)
+**Total Lines of Code:** ~2,300+ lines (excluding dependencies)
+
+**Last Updated:** February 2025
 
 ---
 
@@ -13,13 +15,14 @@ A state-of-the-art robust photometric stereo implementation with multiple solver
 3. [Data Flow](#3-data-flow)
 4. [Key Algorithms](#4-key-algorithms)
 5. [ML/DL Models: Light Direction Predictor](#5-mldl-models-light-direction-predictor)
-6. [Configuration & Parameters](#6-configuration--parameters)
-7. [Entry Points & Usage](#7-entry-points--usage)
-8. [Dependencies & Frameworks](#8-dependencies--frameworks)
-9. [Testing Structure](#9-testing-structure)
-10. [Data Handling & Formats](#10-data-handling--formats)
-11. [Workflow Examples](#11-workflow-examples)
-12. [Key Innovations & Robust Features](#12-key-innovations--robust-features)
+6. [Deep Learning Architecture Details](#6-deep-learning-architecture-details)
+7. [Configuration & Parameters](#7-configuration--parameters)
+8. [Entry Points & Usage](#8-entry-points--usage)
+9. [Dependencies & Frameworks](#9-dependencies--frameworks)
+10. [Testing Structure](#10-testing-structure)
+11. [Data Handling & Formats](#11-data-handling--formats)
+12. [Workflow Examples](#12-workflow-examples)
+13. [Key Innovations & Robust Features](#13-key-innovations--robust-features)
 
 ---
 
@@ -35,30 +38,40 @@ RobustPhotometricStereo/
 │   ├── test.py                   # Test script (30 lines)
 │   ├── pngToNpy.py               # Image conversion utility (56 lines)
 │   └── README.md                 # Project documentation
-├── light_direction_predictor/    # ML/DL module (new feature)
-│   ├── light_direction_predictor.py   # Main ML model (483 lines)
-│   ├── rps_integration.py             # Integration pipeline (382 lines)
-│   ├── __init__.py                    # Package init (8 lines)
-│   ├── data/
-│   │   ├── training/             # Training data (10 objects)
-│   │   └── testing/              # Test data (Pikachu dataset)
-│   └── README.md                 # ML module documentation
-├── data/                         # Dataset directory
-│   ├── buddha/                   # Buddha statue dataset
-│   │   ├── buddhaPNG/            # Raw PNG images (96 images)
-│   │   ├── buddhaPNG_npy/        # Preprocessed NPY images
-│   │   └── light_directions.txt  # Known light directions
-│   ├── bunny/                    # Bunny dataset
-│   │   ├── bunny_lambert/        # Lambertian (with shadow)
-│   │   ├── bunny_lambert_noshadow/  # Lambertian (no shadow)
-│   │   └── bunny_specular/       # Specular reflectance
-│   └── cat/                      # Cat dataset
-└── Output visualizations
-    ├── L1_specular_normal.png
-    ├── L2_specular_normal.png
-    ├── RPCA_specular_normal.png
-    ├── SBL_specular_normal.png
-    └── est_normal.npy            # Estimated normal map
+│
+├── light_direction_predictor/    # ML/DL module
+│   ├── light_direction_predictor.py   # Main predictor class (600+ lines)
+│   ├── dl_models.py                   # Deep learning models (580+ lines) [NEW]
+│   ├── rps_integration.py             # Integration pipeline (493 lines)
+│   ├── __init__.py                    # Package init with exports
+│   ├── light_predictor_v2.pkl         # Trained ML model (Random Forest)
+│   ├── README.md                      # ML/DL module documentation
+│   └── data/
+│       ├── training/             # Training data (10 objects × 96 images)
+│       │   ├── ballPNG/
+│       │   ├── bearPNG/
+│       │   ├── buddhaPNG/
+│       │   ├── catPNG/
+│       │   ├── cowPNG/
+│       │   ├── gobletPNG/
+│       │   ├── harvestPNG/
+│       │   ├── pot1PNG/
+│       │   ├── pot2PNG/
+│       │   └── readingPNG/
+│       └── testing/              # Test data (Pikachu dataset)
+│           ├── batteryPNG/
+│           ├── bootaoPNG/
+│           ├── bootao2PNG/
+│           ├── bootao3PNG/
+│           └── dimooPNG/
+│
+├── data/                         # Original datasets
+│   ├── buddha/
+│   ├── bunny/
+│   └── cat/
+│
+├── CODEBASE_UNDERSTANDING.md     # This documentation
+└── Output visualizations (*.png, *.npy)
 ```
 
 ---
@@ -123,6 +136,28 @@ RobustPhotometricStereo/
 | Visualization | `disp_normalmap()`, `save_normalmap_as_npy()`, `load_normalmap_from_npy()` |
 | Evaluation | `evaluate_angular_error()` |
 
+### D. Light Direction Predictor (`light_direction_predictor.py`)
+
+**Purpose:** ML/DL-based prediction of light directions from images
+
+**Key Components:**
+- `LightDirectionPredictor` - Main class supporting 7 model types
+- `compare_all_models()` - Compare ML + DL models
+- `compare_ml_models()` - Compare only classical ML models
+- `compare_dl_models()` - Compare only deep learning models
+
+### E. Deep Learning Models (`dl_models.py`) [NEW]
+
+**Purpose:** PyTorch-based CNN models for light direction prediction
+
+**Key Components:**
+- `LightCNN` - Custom 5-layer CNN architecture
+- `ResNetLight` - ResNet18 with transfer learning
+- `EfficientNetLight` - EfficientNet-B0 with transfer learning
+- `DeepLightPredictor` - Training and inference wrapper
+- `LightDirectionDataset` - PyTorch Dataset class
+- Loss functions, data augmentation, early stopping utilities
+
 ---
 
 ## 3. Data Flow
@@ -148,12 +183,15 @@ RobustPhotometricStereo/
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│                      3. LIGHT LOADING                           │
+│              3. LIGHT DIRECTION (Known or Predicted)            │
 ├─────────────────────────────────────────────────────────────────┤
-│  rps.load_lighttxt("light_directions.txt")                     │
+│  Option A: rps.load_lighttxt("light_directions.txt")           │
+│                                                                 │
+│  Option B: ML/DL Prediction (NEW)                              │
+│    - LightDirectionPredictor.predict_from_folder()             │
+│    - Supports: ridge, rf, gbr, mlp, cnn, resnet, efficientnet  │
 │         ↓                                                       │
 │  Light matrix L (3 × f)                                        │
-│  [light_x light_y light_z]ᵀ for each image                     │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -177,14 +215,7 @@ RobustPhotometricStereo/
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│                    6. POST-PROCESSING                           │
-├─────────────────────────────────────────────────────────────────┤
-│  - L2 normalization of normals                                 │
-│  - Apply mask (set background to zero)                         │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                        7. OUTPUT                                │
+│                        6. OUTPUT                                │
 ├─────────────────────────────────────────────────────────────────┤
 │  rps.save_normalmap("est_normal")                              │
 │         ↓                                                       │
@@ -285,11 +316,6 @@ Properties:
   - Separates shadows/specularities (sparse outliers)
   - Globally optimal solution
   - Most robust method
-
-Parameters:
-  - λ = 1/√(max(m,n))  [control sparsity]
-  - ρ = 1.5            [dual step scaling]
-  - μ_bar = μ × 1e7    [maximum penalty]
 ```
 
 ### Algorithm Comparison
@@ -311,11 +337,26 @@ Parameters:
 
 Remove dependency on known light directions when collecting own data. Predict 3D light direction vectors from images alone.
 
-### Architecture
+### Available Models (7 Total)
 
-**LightDirectionPredictor Class** (`light_direction_predictor.py`, 483 lines)
+#### Classical ML Models (sklearn-based)
 
-### Feature Extraction Pipeline
+| Model | Code | Description | Speed | Typical Error |
+|-------|------|-------------|-------|---------------|
+| Ridge Regression | `ridge` | Linear regression with L2 regularization | Fast | ~15-20° |
+| Random Forest | `rf` | Ensemble of 200 decision trees | Medium | ~10-15° |
+| Gradient Boosting | `gbr` | Sequential ensemble learning | Slow | ~8-12° |
+| MLP | `mlp` | Multi-layer perceptron (512-256-128) | Medium | ~10-15° |
+
+#### Deep Learning Models (PyTorch-based) [NEW]
+
+| Model | Code | Description | Speed | Expected Error |
+|-------|------|-------------|-------|----------------|
+| Custom CNN | `cnn` | 5-layer CNN designed for light estimation | Fast | ~8-12° |
+| ResNet18 | `resnet` | Transfer learning from ImageNet | Medium | ~5-10° |
+| EfficientNet-B0 | `efficientnet` | Efficient architecture with transfer learning | Medium | ~5-10° |
+
+### Feature Extraction Pipeline (ML Models)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -356,15 +397,6 @@ Remove dependency on known light directions when collecting own data. Predict 3D
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Machine Learning Models
-
-| Model | Configuration | Typical Error | Notes |
-|-------|--------------|---------------|-------|
-| **Ridge Regression** | α=10.0 | ~15-20° | Fast baseline |
-| **Random Forest** | 200 trees, max_depth=15 | ~10-15° | **Current best** |
-| **Gradient Boosting** | 100 estimators, max_depth=5 | ~8-12° | Best generalization |
-| **MLP Neural Network** | 512-256-128 hidden layers | ~10-15° | Deep learning approach |
-
 ### Training Data Structure
 
 ```
@@ -397,18 +429,133 @@ error = arccos(clip(cos_sim, -1, 1)) × 180/π
 - Per-object error reporting
 - Enables unbiased model comparison
 
-### Integration Pipeline (`rps_integration.py`)
+---
 
-| Function | Purpose |
-|----------|---------|
-| `train_light_predictor()` | Train from scratch or load existing |
-| `predict_light_directions()` | Predict for new images |
-| `run_rps_pipeline()` | Execute RPS with predicted lights |
-| `evaluate_results()` | Compare with ground truth |
+## 6. Deep Learning Architecture Details [NEW]
+
+### Custom CNN (`cnn`) - LightCNN
+
+```
+Input: (1, 128, 128) grayscale image
+         ↓
+Conv Block 1: Conv(1→32, 3×3) + BN + ReLU + Conv(32→32) + BN + ReLU + MaxPool(2) + Dropout(0.3)
+         ↓  Output: (32, 64, 64)
+Conv Block 2: Conv(32→64, 3×3) + BN + ReLU + Conv(64→64) + BN + ReLU + MaxPool(2) + Dropout(0.3)
+         ↓  Output: (64, 32, 32)
+Conv Block 3: Conv(64→128, 3×3) + BN + ReLU + Conv(128→128) + BN + ReLU + MaxPool(2) + Dropout(0.3)
+         ↓  Output: (128, 16, 16)
+Conv Block 4: Conv(128→256, 3×3) + BN + ReLU + Conv(256→256) + BN + ReLU + MaxPool(2) + Dropout(0.3)
+         ↓  Output: (256, 8, 8)
+Conv Block 5: Conv(256→512, 3×3) + BN + ReLU + Conv(512→512) + BN + ReLU + MaxPool(2) + Dropout(0.3)
+         ↓  Output: (512, 4, 4)
+Global Average Pooling
+         ↓  Output: (512,)
+FC(512→256) + ReLU + Dropout(0.3)
+         ↓
+FC(256→128) + ReLU + Dropout(0.3)
+         ↓
+FC(128→3)
+         ↓
+L2 Normalize
+         ↓
+Output: 3D Light Direction (unit vector)
+```
+
+### ResNet18 Transfer Learning (`resnet`) - ResNetLight
+
+```
+Pretrained ResNet18 (ImageNet weights)
+         ↓
+Modified Conv1: Conv(1→64, 7×7) for grayscale input
+  - Initialized with mean of RGB pretrained weights
+         ↓
+ResNet18 Feature Extractor (frozen or fine-tuned)
+         ↓
+Global Average Pooling → 512 features
+         ↓
+Dropout(0.3)
+         ↓
+FC(512→256) + ReLU + Dropout(0.3)
+         ↓
+FC(256→3)
+         ↓
+L2 Normalize
+         ↓
+Output: 3D Light Direction (unit vector)
+```
+
+### EfficientNet-B0 (`efficientnet`) - EfficientNetLight
+
+```
+Pretrained EfficientNet-B0 (ImageNet weights)
+         ↓
+Modified First Conv: Conv(1→32, 3×3) for grayscale
+         ↓
+EfficientNet-B0 Feature Extractor
+         ↓
+Global Average Pooling → 1280 features
+         ↓
+Dropout(0.3)
+         ↓
+FC(1280→256) + ReLU + Dropout(0.3)
+         ↓
+FC(256→3)
+         ↓
+L2 Normalize
+         ↓
+Output: 3D Light Direction (unit vector)
+```
+
+### Data Augmentation Pipeline
+
+For small datasets (960 images), augmentation is critical:
+
+```python
+transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485], std=[0.229]),
+    transforms.RandomApply([
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
+    ], p=0.3),
+])
+```
+
+### Loss Functions
+
+**CombinedLoss** (default):
+```
+Loss = 0.7 × CosineSimilarityLoss + 0.3 × MSELoss
+```
+
+**CosineSimilarityLoss:**
+```
+Loss = 1 - cos(predicted, target)
+```
+
+### Training Features
+
+| Feature | Configuration |
+|---------|--------------|
+| **Optimizer** | AdamW with weight_decay=1e-4 |
+| **Learning Rate** | 1e-4 (default), cosine annealing to 1e-6 |
+| **Batch Size** | 32 |
+| **Early Stopping** | Patience=20 epochs, min_delta=0.001 |
+| **Validation Split** | 15% |
+| **Max Epochs** | 100 |
+
+### Device Support
+
+- **CUDA** (NVIDIA GPUs) - Auto-detected
+- **MPS** (Apple Silicon) - Auto-detected
+- **CPU** - Fallback
 
 ---
 
-## 6. Configuration & Parameters
+## 7. Configuration & Parameters
 
 ### RPS Solver Parameters
 
@@ -441,18 +588,45 @@ tol = 1.0e-6
 
 ### Light Direction Predictor Configuration
 
+**ML Models:**
 ```python
 img_size = 64           # Image resize dimension
 n_pca = 64              # PCA components
 normalize_images = True # Image normalization
-
-# Model parameters
 model_type = 'rf'       # Options: 'ridge', 'rf', 'gbr', 'mlp'
+```
+
+**DL Models:** [NEW]
+```python
+img_size = 128          # Image resize dimension (larger for DL)
+model_type = 'resnet'   # Options: 'cnn', 'resnet', 'efficientnet'
+epochs = 100            # Training epochs
+batch_size = 32         # Batch size
+lr = 1e-4               # Learning rate
+use_augmentation = True # Data augmentation
 ```
 
 ---
 
-## 7. Entry Points & Usage
+## 8. Entry Points & Usage
+
+### Command Line Interface [NEW]
+
+```bash
+# Compare all models (ML + DL)
+python light_direction_predictor.py --mode compare_all --epochs 50
+
+# Compare only ML models (no PyTorch required)
+python light_direction_predictor.py --mode compare_ml
+
+# Compare only DL models
+python light_direction_predictor.py --mode compare_dl --epochs 50
+
+# Train a specific model
+python light_direction_predictor.py --mode train --model resnet --epochs 100 --output ./model.pkl
+
+# Available model options: ridge, rf, gbr, mlp, cnn, resnet, efficientnet
+```
 
 ### Main Script: `demo.py`
 
@@ -468,65 +642,144 @@ rps.solve(RPS.L2_SOLVER)
 rps.save_normalmap(filename="./est_normal")
 ```
 
-### ML Integration: `rps_integration.py`
+### ML Model Training
 
 ```python
 from light_direction_predictor import LightDirectionPredictor
 
-# Train predictor
+# Train ML model (Random Forest)
 predictor = LightDirectionPredictor(img_size=64, n_pca=64)
-X, Y, groups = predictor.load_training_data('./data/training/')
+X, Y, groups, folders = predictor.load_training_data('./data/training/')
 predictor.train(X, Y, model_type='rf')
-predictor.save('./light_predictor_v2.pkl')
-
-# Predict and run RPS
-lights = predictor.predict_from_folder('./test_images/')
-rps = run_rps_pipeline(images_folder, lights_path, mask_path)
+predictor.save('./light_predictor_rf.pkl')
 ```
 
-### Data Conversion: `pngToNpy.py`
+### DL Model Training [NEW]
 
-Convert PNG images to NumPy arrays with proper naming for faster loading.
+```python
+from light_direction_predictor import LightDirectionPredictor
+import glob
+import os
+
+predictor = LightDirectionPredictor()
+X, Y, groups, folders = predictor.load_training_data('./data/training/')
+
+# Collect image paths for DL models
+img_paths = []
+for folder in folders:
+    imgs = sorted(glob.glob(os.path.join(folder, '*.png')))
+    imgs = [f for f in imgs if 'mask' not in f.lower() and 'normal' not in f.lower()]
+    img_paths.extend(imgs[:96])  # Match with light directions
+
+# Train ResNet18 model
+predictor.train(X, Y, model_type='resnet', img_paths=img_paths, epochs=100)
+predictor.save('./light_predictor_resnet.pkl')
+```
+
+### Model Comparison [NEW]
+
+```python
+from light_direction_predictor import compare_all_models, compare_ml_models, compare_dl_models
+
+# Compare all 7 models
+best_model, results = compare_all_models('./data/training/', include_dl=True, dl_epochs=50)
+
+# Compare only ML models
+best_ml, ml_results = compare_ml_models('./data/training/')
+
+# Compare only DL models
+best_dl, dl_results = compare_dl_models('./data/training/', epochs=50)
+```
+
+### Inference
+
+```python
+from light_direction_predictor import LightDirectionPredictor
+
+# Load trained model (works for both ML and DL)
+predictor = LightDirectionPredictor()
+predictor.load('./light_predictor_resnet.pkl')
+
+# Predict light directions
+lights = predictor.predict_from_folder('./my_images/', output_file='predicted_lights.txt')
+
+# Use with RPS
+from rps import RPS
+rps = RPS()
+rps.load_lighttxt('predicted_lights.txt')
+rps.load_images('./my_images/')
+rps.solve(RPS.RPCA_SOLVER)
+```
 
 ---
 
-## 8. Dependencies & Frameworks
+## 9. Dependencies & Frameworks
 
-### External Libraries
+### Core Dependencies
 
-| Library | Purpose |
-|---------|---------|
-| `numpy` | Matrix operations, linear algebra |
-| `scipy` | ndimage filters, numerical operations |
-| `opencv-cv2` | Image I/O, visualization |
-| `scikit-learn` | ML models, preprocessing (PCA, StandardScaler) |
-| `scikit-image` | Image processing utilities |
-| `Pillow` | Image loading and resizing |
-| `pickle` | Model serialization (built-in) |
+| Library | Purpose | Required |
+|---------|---------|----------|
+| `numpy` | Matrix operations, linear algebra | Yes |
+| `scipy` | ndimage filters, numerical operations | Yes |
+| `opencv-cv2` | Image I/O, visualization | Yes |
+| `scikit-learn` | ML models, preprocessing (PCA, StandardScaler) | Yes |
+| `Pillow` | Image loading and resizing | Yes |
+| `pickle` | Model serialization (built-in) | Yes |
 
-### Key NumPy/SciPy Functions Used
+### Deep Learning Dependencies [NEW]
 
+| Library | Purpose | Required |
+|---------|---------|----------|
+| `torch` | PyTorch deep learning framework | For DL models |
+| `torchvision` | Pretrained models, transforms | For DL models |
+
+### Installation
+
+```bash
+# Basic installation (ML models only)
+pip install numpy scipy opencv-python scikit-learn pillow
+
+# Full installation (ML + DL models)
+pip install numpy scipy opencv-python scikit-learn pillow torch torchvision
+```
+
+### Key Functions Used
+
+**NumPy/SciPy:**
 - `np.linalg.lstsq()` - Least squares solver
 - `np.linalg.svd()` - Singular value decomposition
-- `np.linalg.solve()` - Linear system solver
 - `scipy.ndimage.sobel()` - Gradient computation
 - `scipy.ndimage.gaussian_filter()` - Smoothing
 
+**PyTorch:** [NEW]
+- `torch.nn.Conv2d` - Convolutional layers
+- `torch.nn.BatchNorm2d` - Batch normalization
+- `torchvision.models.resnet18` - Pretrained ResNet
+- `torchvision.models.efficientnet_b0` - Pretrained EfficientNet
+- `torch.optim.AdamW` - Optimizer with weight decay
+
 ---
 
-## 9. Testing Structure
+## 10. Testing Structure
 
 ### Test Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `test.py` | 30 | Basic functionality smoke tests |
+| `rps_integration.py` | 493 | Integration tests and pipeline validation |
 
-### Cross-Validation in Light Predictor
+### Cross-Validation
 
-- Leave-One-Object-Out (LOGO) strategy
+**Leave-One-Object-Out (LOGO):**
+- Tests generalization to unseen objects
 - Evaluates on 10 objects independently
-- Outputs per-object and overall errors
+- Reports per-object and overall errors
+
+**Usage:**
+```python
+errors = predictor.cross_validate(X, Y, groups, model_type='resnet', img_paths=img_paths)
+```
 
 ### Datasets for Validation
 
@@ -534,13 +787,13 @@ Convert PNG images to NumPy arrays with proper naming for faster loading.
 - 10 objects × 96 images = 960 samples
 - Known light directions for each
 
-**Testing:**
-- Pikachu dataset (custom data)
-- Prepared for light direction prediction evaluation
+**Testing (Pikachu dataset):**
+- 5 objects: battery, bootao, bootao2, bootao3, dimoo
+- Used for real-world validation
 
 ---
 
-## 10. Data Handling & Formats
+## 11. Data Handling & Formats
 
 ### Input Formats
 
@@ -560,7 +813,6 @@ Format: f × 3 matrix where f = number of images
 
 **Mask Image:**
 - PNG image where non-zero = foreground, zero = background
-- Used to ignore pixels (background, invalid regions)
 
 ### Output Formats
 
@@ -568,6 +820,10 @@ Format: f × 3 matrix where f = number of images
 - **NPY:** (height × width × 3) array
 - **Range:** [-1, 1] (unit normals)
 - **Display:** Rescaled to [0, 1] as RGB: `(N + 1) / 2`
+
+**Trained Models:**
+- **ML Models:** `.pkl` (pickle format)
+- **DL Models:** `.pkl` (metadata) + `.pt` (PyTorch state dict)
 
 ### Data Structures
 
@@ -579,7 +835,7 @@ Format: f × 3 matrix where f = number of images
 
 ---
 
-## 11. Workflow Examples
+## 12. Workflow Examples
 
 ### Example 1: Standard RPS on Known Data
 
@@ -594,40 +850,65 @@ rps.solve(RPS.RPCA_SOLVER)  # Most robust
 rps.save_normalmap('./output')
 ```
 
-### Example 2: Light Direction Prediction + RPS
+### Example 2: ML-Based Light Prediction + RPS
 
 ```python
 from light_direction_predictor import LightDirectionPredictor
 from rps_integration import run_rps_pipeline
 
-# Load pre-trained model
+# Load pre-trained ML model
 predictor = LightDirectionPredictor()
 predictor.load('./light_predictor_v2.pkl')
 
 # Predict on new images
-lights = predictor.predict_from_folder('./my_images/')
+lights = predictor.predict_from_folder('./my_images/', output_file='lights.txt')
 
 # Run RPS
-rps = run_rps_pipeline('./my_images/', lights_path, mask_path)
+rps = run_rps_pipeline('./my_images/', 'lights.txt', 'mask.png')
 ```
 
-### Example 3: Train Custom Model
+### Example 3: DL-Based Light Prediction + RPS [NEW]
 
 ```python
 from light_direction_predictor import LightDirectionPredictor
+import glob
 
-predictor = LightDirectionPredictor(img_size=64, n_pca=64)
-X, Y, groups = predictor.load_training_data('./data/training/')
-predictor.cross_validate(X, Y, groups, model_type='gbr')
-predictor.train(X, Y, model_type='gbr')
-predictor.save('./my_model.pkl')
+# Train ResNet model
+predictor = LightDirectionPredictor()
+X, Y, groups, folders = predictor.load_training_data('./data/training/')
+
+img_paths = []
+for folder in folders:
+    imgs = sorted(glob.glob(f"{folder}/*.png"))
+    imgs = [f for f in imgs if 'mask' not in f.lower()]
+    img_paths.extend(imgs[:96])
+
+predictor.train(X, Y, model_type='resnet', img_paths=img_paths, epochs=100)
+predictor.save('./model_resnet.pkl')
+
+# Inference on new data
+lights = predictor.predict_from_folder('./new_images/', output_file='predicted_lights.txt')
+```
+
+### Example 4: Compare All Models [NEW]
+
+```python
+from light_direction_predictor import compare_all_models
+
+# Run comprehensive comparison
+best_model, results = compare_all_models('./data/training/', include_dl=True, dl_epochs=50)
+
+print(f"Best model: {best_model}")
+print("All results:")
+for model, error in sorted(results.items(), key=lambda x: x[1]):
+    print(f"  {model}: {error:.2f}°")
 ```
 
 ---
 
-## 12. Key Innovations & Robust Features
+## 13. Key Innovations & Robust Features
 
-### Robustness Mechanisms
+### Robustness Mechanisms (RPS)
 
 | Mechanism | Description |
 |-----------|-------------|
@@ -640,10 +921,21 @@ predictor.save('./my_model.pkl')
 
 | Feature | Description |
 |---------|-------------|
-| **Physics-informed features** | Designed for lighting, not object-specific |
+| **Physics-informed features** | 42 features designed for lighting, not object-specific |
 | **Multi-scale analysis** | Captures features at different resolutions |
 | **Image normalization** | Reduces object-specific intensity bias |
+| **Transfer learning** [NEW] | Leverages ImageNet pretrained weights |
+| **Data augmentation** [NEW] | Effectively increases dataset size |
 | **Ensemble methods** | Random forests leverage non-linear patterns |
+
+### Deep Learning Advantages [NEW]
+
+| Advantage | Description |
+|-----------|-------------|
+| **End-to-end learning** | Learns optimal features automatically |
+| **Transfer learning** | Uses knowledge from 1M+ ImageNet images |
+| **Better generalization** | Expected 30-50% error reduction vs ML |
+| **GPU acceleration** | Fast training on CUDA/MPS devices |
 
 ### Performance Optimizations
 
@@ -652,26 +944,42 @@ predictor.save('./my_model.pkl')
 | **Multicore processing** | L1 and SBL solvers use multiprocessing |
 | **NumPy vectorization** | Efficient matrix operations throughout |
 | **NPY format** | Faster image I/O compared to PNG reading |
-| **Flexible solvers** | Choose method based on robustness/speed tradeoff |
+| **GPU support** [NEW] | DL models leverage CUDA/MPS acceleration |
+| **Early stopping** [NEW] | Prevents overfitting in DL training |
 
 ---
 
 ## Project Status
 
-**Current Branch:** `thanhnh/improve_ml_dl_models`
+**Current Branch:** `thanhn/adding_dl_model`
 
-**Recent Activity:**
-- Merge: ML Light Detection feature branch
-- Adding README for Pikachu test data
-- Bug fixes and testing data organization
+**Recent Updates (February 2025):**
+- Added deep learning models (CNN, ResNet18, EfficientNet)
+- Integrated PyTorch-based training pipeline
+- Added data augmentation for small datasets
+- Updated CLI with model comparison tools
+- Unified API for ML and DL models
+
+**Available Models:**
+- ML: `ridge`, `rf`, `gbr`, `mlp`
+- DL: `cnn`, `resnet`, `efficientnet`
 
 **Key Contributions:**
 - Original RPS implementation by Yasuyuki Matsushita (Osaka University)
-- ML light direction prediction module (recent addition)
-- Integration pipeline for end-to-end workflows
+- ML light direction prediction module
+- Deep learning integration with transfer learning [NEW]
+- End-to-end pipeline for calibration-free photometric stereo
 
 ---
 
 ## Summary
 
-This codebase implements state-of-the-art robust photometric stereo with an innovative ML-based extension to predict light directions without manual calibration. The modular design enables researchers to compare multiple algorithms while maintaining clean, maintainable code.
+This codebase implements state-of-the-art robust photometric stereo with an innovative ML/DL-based extension to predict light directions without manual calibration. The system now supports:
+
+1. **6 RPS solver algorithms** for robust normal estimation
+2. **4 classical ML models** for light direction prediction
+3. **3 deep learning models** [NEW] with transfer learning for improved accuracy
+4. **Unified API** for seamless model switching and comparison
+5. **Comprehensive evaluation** with leave-one-object-out cross-validation
+
+The modular design enables researchers to compare multiple algorithms while maintaining clean, maintainable code.

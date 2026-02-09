@@ -3,7 +3,7 @@ from __future__ import print_function
 import numpy as np
 import time
 from rps import RPS
-import psutil
+import ps_utils
 
 # Choose a method
 METHOD = RPS.L2_SOLVER    # Least-squares
@@ -47,9 +47,9 @@ print("Photometric stereo: elapsed_time:{0}".format(elapsed_time) + "[sec]")
 rps.save_normalmap(filename="./est_normal")    # Save the estimated normal map
 
 # Evaluate the estimate
-N_gt = psutil.load_normalmap_from_npy(filename=GT_NORMAL_FILENAME)    # read out the ground truth surface normal
+N_gt = ps_utils.load_normalmap_from_npy(filename=GT_NORMAL_FILENAME)    # read out the ground truth surface normal
 N_gt = np.reshape(N_gt, (rps.height*rps.width, 3))    # reshape as a normal array (p \times 3)
-angular_err = psutil.evaluate_angular_error(N_gt, rps.N, rps.background_ind)    # compute angular error
+angular_err = ps_utils.evaluate_angular_error(N_gt, rps.N, rps.background_ind)    # compute angular error
 print("Mean angular error [deg]: ", np.mean(angular_err[:]))
-psutil.disp_normalmap(normal=rps.N, height=rps.height, width=rps.width)
+ps_utils.disp_normalmap(normal=rps.N, height=rps.height, width=rps.width)
 print("done.")

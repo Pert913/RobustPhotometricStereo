@@ -1,15 +1,27 @@
 """
 Light Direction Predictor for Robust Photometric Stereo
 ========================================================
-Train ML models to predict light directions from images only.
+Train ML/DL models to predict light directions from images only.
 
+Available Models:
+-----------------
+Classical ML:
+  - ridge: Ridge Regression (fast baseline)
+  - rf: Random Forest (good balance)
+  - gbr: Gradient Boosting Regressor
+  - mlp: Multi-Layer Perceptron (sklearn)
+
+Deep Learning (requires PyTorch):
+  - cnn: Custom Lightweight CNN
+  - resnet: ResNet18 Transfer Learning
+  - efficientnet: EfficientNet-B0 Transfer Learning
 
 Improvements:
 1. Better physics-based features (shading-invariant)
 2. Image normalization to reduce object-specific bias
 3. Multi-scale features
-4. Ensemble option
-5. Better neural network architecture
+4. Deep learning with transfer learning
+5. Data augmentation for small datasets
 """
 
 import numpy as np
@@ -28,17 +40,37 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# Check for deep learning support
+try:
+    from .dl_models import DeepLightPredictor, TORCH_AVAILABLE
+except ImportError:
+    try:
+        from dl_models import DeepLightPredictor, TORCH_AVAILABLE
+    except ImportError:
+        TORCH_AVAILABLE = False
+        DeepLightPredictor = None
+
+# Define which models are deep learning based
+DL_MODELS = ['cnn', 'resnet', 'efficientnet']
+ML_MODELS = ['ridge', 'rf', 'gbr', 'mlp']
+ALL_MODELS = ML_MODELS + DL_MODELS
+
 
 class LightDirectionPredictor:
     """
-    Predicts light direction vectors from images using ML.
+    Predicts light direction vectors from images using ML or DL.
+
+    Supports both classical ML models (ridge, rf, gbr, mlp) and
+    deep learning models (cnn, resnet, efficientnet).
     """
 
     def __init__(self, img_size=64, n_pca=64, normalize_images=True):
         """
         Args:
-            img_size: Resize images to (img_size x img_size)
-            n_pca: Number of PCA components for image features
+            img_size: Resize images to (img_size x img_size) for ML models
+                      DL models use 128x128 by default
+            n_pca: Number of PCA components for image features (ML only)
+            normalize_images: Whether to normalize images (ML only)
         """
         self.img_size = img_size
         self.n_pca = n_pca
@@ -46,6 +78,8 @@ class LightDirectionPredictor:
         self.pca = None
         self.scaler = None
         self.model = None
+        self.dl_predictor = None  # For deep learning models
+        self.model_type = None
         self.is_fitted = False
 
     # ==================== FEATURE EXTRACTION ====================
@@ -279,26 +313,50 @@ class LightDirectionPredictor:
 
     # ==================== TRAINING ====================
 
-    def train(self, X, Y, model_type='mlp'):
+    def train(self, X, Y, model_type='mlp', img_paths=None, groups=None, **dl_kwargs):
         """
         Train the light direction prediction model.
 
         Args:
-            X: Feature matrix
+            X: Feature matrix (for ML models) or None (for DL models)
             Y: Light direction targets (n_samples x 3)
-            model_type: 'ridge', 'rf', or 'mlp'
+            model_type: Model type - ML: 'ridge', 'rf', 'gbr', 'mlp'
+                                     DL: 'cnn', 'resnet', 'efficientnet'
+            img_paths: List of image paths (required for DL models)
+            groups: Group labels (optional, for DL validation)
+            **dl_kwargs: Additional kwargs for DL training (epochs, batch_size, lr)
+
+        Returns:
+            angular_errors: Training angular errors
         """
-        print(f"\nTraining {model_type} model...")
+        self.model_type = model_type
+
+        # Check if this is a deep learning model
+        if model_type in DL_MODELS:
+            if not TORCH_AVAILABLE:
+                raise ImportError(
+                    f"PyTorch is required for {model_type} model. "
+                    "Install with: pip install torch torchvision"
+                )
+            if img_paths is None:
+                raise ValueError("img_paths required for deep learning models")
+
+            return self._train_dl(img_paths, Y, model_type, **dl_kwargs)
+        else:
+            return self._train_ml(X, Y, model_type)
+
+    def _train_ml(self, X, Y, model_type):
+        """Train classical ML model."""
+        print(f"\nTraining {model_type.upper()} model (Classical ML)...")
 
         if model_type == 'ridge':
-            self.model = Ridge(alpha=10.0)  # Higher regularization
+            self.model = Ridge(alpha=10.0)
         elif model_type == 'rf':
             self.model = RandomForestRegressor(
                 n_estimators=200, max_depth=15,
-                min_samples_leaf=5, n_jobs=1, random_state=42
+                min_samples_leaf=5, n_jobs=-1, random_state=42
             )
         elif model_type == 'gbr':
-            # Gradient Boosting - often better generalization
             from sklearn.multioutput import MultiOutputRegressor
             self.model = MultiOutputRegressor(
                 GradientBoostingRegressor(
@@ -310,7 +368,7 @@ class LightDirectionPredictor:
             self.model = MLPRegressor(
                 hidden_layer_sizes=(512, 256, 128),
                 activation='relu',
-                alpha=0.01,  # L2 regularization
+                alpha=0.01,
                 batch_size=32,
                 learning_rate='adaptive',
                 max_iter=2000,
@@ -320,7 +378,7 @@ class LightDirectionPredictor:
                 random_state=42
             )
         else:
-            raise ValueError(f"Unknown model: {model_type}")
+            raise ValueError(f"Unknown ML model: {model_type}")
 
         self.model.fit(X, Y)
         self.is_fitted = True
@@ -329,29 +387,76 @@ class LightDirectionPredictor:
         Y_pred = self.model.predict(X)
         Y_pred = Y_pred / (np.linalg.norm(Y_pred, axis=1, keepdims=True) + 1e-8)
 
-        # Angular error (degrees)
         cos_sim = np.clip(np.sum(Y * Y_pred, axis=1), -1, 1)
         angular_errors = np.arccos(cos_sim) * 180 / np.pi
         print(f"Training angular error: {angular_errors.mean():.2f}° ± {angular_errors.std():.2f}°")
 
         return angular_errors
 
-    def cross_validate(self, X, Y, groups, model_type='mlp'):
+    def _train_dl(self, img_paths, Y, model_type, epochs=100, batch_size=32, lr=1e-4, **kwargs):
+        """Train deep learning model."""
+        print(f"\nTraining {model_type.upper()} model (Deep Learning)...")
+
+        # Create DL predictor
+        self.dl_predictor = DeepLightPredictor(model_type=model_type, img_size=128)
+
+        # Train
+        history = self.dl_predictor.train(
+            img_paths, Y,
+            epochs=epochs, batch_size=batch_size, lr=lr,
+            use_augmentation=True, verbose=True
+        )
+
+        self.is_fitted = True
+
+        # Return final training errors
+        return np.array([history['train_error'][-1]])
+
+    def cross_validate(self, X, Y, groups, model_type='mlp', img_paths=None, **dl_kwargs):
         """
         Leave-one-object-out cross-validation.
         This tests how well the model generalizes to unseen objects.
+
+        Args:
+            X: Feature matrix (for ML models)
+            Y: Light direction targets
+            groups: Object group labels
+            model_type: Model type (ML or DL)
+            img_paths: List of image paths (required for DL models)
+            **dl_kwargs: Additional kwargs for DL training
+
+        Returns:
+            errors: Angular errors for all samples
         """
-        print(f"\nLeave-One-Object-Out Cross-validating {model_type}...")
+        # Check if this is a deep learning model
+        if model_type in DL_MODELS:
+            if not TORCH_AVAILABLE:
+                raise ImportError(
+                    f"PyTorch is required for {model_type} model. "
+                    "Install with: pip install torch torchvision"
+                )
+            if img_paths is None:
+                raise ValueError("img_paths required for deep learning models")
+
+            return self._cross_validate_dl(img_paths, Y, groups, model_type, **dl_kwargs)
+        else:
+            return self._cross_validate_ml(X, Y, groups, model_type)
+
+    def _cross_validate_ml(self, X, Y, groups, model_type):
+        """Cross-validate classical ML model."""
+        print(f"\nLeave-One-Object-Out Cross-validating {model_type.upper()} (Classical ML)...")
 
         if model_type == 'ridge':
             model = Ridge(alpha=10.0)
         elif model_type == 'rf':
-            model = RandomForestRegressor(n_estimators=200, max_depth=15, min_samples_leaf=5, n_jobs=1)
+            model = RandomForestRegressor(n_estimators=200, max_depth=15, min_samples_leaf=5, n_jobs=-1)
         elif model_type == 'gbr':
             from sklearn.multioutput import MultiOutputRegressor
             model = MultiOutputRegressor(GradientBoostingRegressor(n_estimators=100, max_depth=5))
         elif model_type == 'mlp':
             model = MLPRegressor(hidden_layer_sizes=(512, 256, 128), alpha=0.01, max_iter=1000)
+        else:
+            raise ValueError(f"Unknown ML model: {model_type}")
 
         logo = LeaveOneGroupOut()
         Y_pred = cross_val_predict(model, X, Y, groups=groups, cv=logo)
@@ -369,6 +474,17 @@ class LightDirectionPredictor:
         print(f"\nOverall CV angular error: {errors.mean():.2f}° ± {errors.std():.2f}°")
         return errors
 
+    def _cross_validate_dl(self, img_paths, Y, groups, model_type, epochs=50, batch_size=32, lr=1e-4):
+        """Cross-validate deep learning model."""
+        print(f"\nLeave-One-Object-Out Cross-validating {model_type.upper()} (Deep Learning)...")
+
+        dl_predictor = DeepLightPredictor(model_type=model_type, img_size=128)
+        errors, per_object = dl_predictor.cross_validate(
+            img_paths, Y, groups,
+            epochs=epochs, batch_size=batch_size, lr=lr, verbose=True
+        )
+        return errors
+
     # ==================== INFERENCE ====================
 
     def predict(self, img_paths):
@@ -384,9 +500,13 @@ class LightDirectionPredictor:
         if not self.is_fitted:
             raise ValueError("Model not trained. Call train() first.")
 
-        X = self.extract_features(img_paths, fit_pca=False)
-        Y_pred = self.model.predict(X)
-        return Y_pred / (np.linalg.norm(Y_pred, axis=1, keepdims=True) + 1e-8)
+        # Use DL predictor if model is deep learning based
+        if self.model_type in DL_MODELS:
+            return self.dl_predictor.predict(img_paths)
+        else:
+            X = self.extract_features(img_paths, fit_pca=False)
+            Y_pred = self.model.predict(X)
+            return Y_pred / (np.linalg.norm(Y_pred, axis=1, keepdims=True) + 1e-8)
 
     def predict_from_folder(self, folder, output_file=None):
         """
@@ -418,67 +538,426 @@ class LightDirectionPredictor:
         if not self.is_fitted:
             raise ValueError("Model not trained.")
 
-        with open(path, 'wb') as f:
-            pickle.dump({
-                'img_size': self.img_size, 'n_pca': self.n_pca,
-                'normalize': self.normalize_images,
-                'pca': self.pca, 'scaler': self.scaler, 'model': self.model
-            }, f)
+        # Handle DL models differently
+        if self.model_type in DL_MODELS:
+            # Save DL model with .pt extension
+            dl_path = path.replace('.pkl', '_dl.pt') if path.endswith('.pkl') else path + '_dl.pt'
+            self.dl_predictor.save(dl_path)
+
+            # Save metadata
+            with open(path, 'wb') as f:
+                pickle.dump({
+                    'model_type': self.model_type,
+                    'is_dl': True,
+                    'dl_path': dl_path
+                }, f)
+        else:
+            # Save ML model
+            with open(path, 'wb') as f:
+                pickle.dump({
+                    'model_type': self.model_type,
+                    'is_dl': False,
+                    'img_size': self.img_size,
+                    'n_pca': self.n_pca,
+                    'normalize': self.normalize_images,
+                    'pca': self.pca,
+                    'scaler': self.scaler,
+                    'model': self.model
+                }, f)
         print(f"Model saved to: {path}")
 
     def load(self, path):
-        """Load model."""
+        """Load model (ML or DL)."""
         with open(path, 'rb') as f:
             d = pickle.load(f)
-        self.img_size = d['img_size']
-        self.n_pca = d['n_pca']
-        self.normalize_images = d['normalize']
-        self.pca = d['pca']
-        self.scaler = d['scaler']
-        self.model = d['model']
+
+        self.model_type = d.get('model_type', 'rf')  # Default to rf for old models
+
+        if d.get('is_dl', False):
+            # Load DL model
+            if not TORCH_AVAILABLE:
+                raise ImportError("PyTorch required to load this model")
+
+            self.dl_predictor = DeepLightPredictor(model_type=self.model_type)
+            self.dl_predictor.load(d['dl_path'])
+        else:
+            # Load ML model
+            self.img_size = d['img_size']
+            self.n_pca = d['n_pca']
+            self.normalize_images = d['normalize']
+            self.pca = d['pca']
+            self.scaler = d['scaler']
+            self.model = d['model']
+
         self.is_fitted = True
         print(f"Model loaded from: {path}")
 
 
-def compare_all_models(training_folder):
-    """Compare all model types."""
-    print("=" * 60)
-    print("COMPARING ALL MODELS")
-    print("=" * 60)
+def compare_all_models(training_folder, include_dl=True, dl_epochs=50):
+    """
+    Compare all model types (ML and optionally DL).
+
+    Args:
+        training_folder: Path to training data folder
+        include_dl: Whether to include deep learning models
+        dl_epochs: Number of epochs for DL model cross-validation
+
+    Returns:
+        best_model: Name of best performing model
+        results: Dict of model_type -> mean_error
+    """
+    print("=" * 70)
+    print("COMPARING ALL MODELS (ML + DL)")
+    print("=" * 70)
 
     predictor = LightDirectionPredictor(img_size=64, n_pca=64)
-    X, Y, groups, _ = predictor.load_training_data(training_folder)
+    X, Y, groups, object_folders = predictor.load_training_data(training_folder)
+
+    # Get image paths for DL models
+    img_paths = []
+    for gid, folder in enumerate(object_folders):
+        imgs = sorted(glob.glob(os.path.join(folder, '*.png')))
+        imgs = [f for f in imgs if 'mask' not in f.lower() and 'normal' not in f.lower()]
+        light_file = os.path.join(folder, 'light_directions.txt')
+        if os.path.exists(light_file):
+            lights = np.loadtxt(light_file)
+            n = min(len(imgs), len(lights))
+            img_paths.extend(imgs[:n])
 
     results = {}
-    for model_type in ['ridge', 'rf', 'gbr', 'mlp']:
-        print(f"\n{'=' * 40}")
+
+    # ==================== ML MODELS ====================
+    print("\n" + "=" * 70)
+    print("CLASSICAL MACHINE LEARNING MODELS")
+    print("=" * 70)
+
+    for model_type in ML_MODELS:
+        print(f"\n{'=' * 50}")
+        print(f"Model: {model_type.upper()}")
+        print("=" * 50)
         errors = predictor.cross_validate(X, Y, groups, model_type=model_type)
         results[model_type] = errors.mean()
 
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for m, err in sorted(results.items(), key=lambda x: x[1]):
-        print(f"  {m:8s}: {err:.2f}°")
+    # ==================== DL MODELS ====================
+    if include_dl and TORCH_AVAILABLE:
+        print("\n" + "=" * 70)
+        print("DEEP LEARNING MODELS")
+        print("=" * 70)
+
+        for model_type in DL_MODELS:
+            print(f"\n{'=' * 50}")
+            print(f"Model: {model_type.upper()}")
+            print("=" * 50)
+            errors = predictor.cross_validate(
+                X, Y, groups, model_type=model_type,
+                img_paths=img_paths, epochs=dl_epochs
+            )
+            results[model_type] = errors.mean()
+    elif include_dl and not TORCH_AVAILABLE:
+        print("\n[WARNING] PyTorch not available. Skipping DL models.")
+        print("Install with: pip install torch torchvision")
+
+    # ==================== SUMMARY ====================
+    print("\n" + "=" * 70)
+    print("SUMMARY - ALL MODELS COMPARISON")
+    print("=" * 70)
+
+    # Separate ML and DL results
+    ml_results = {k: v for k, v in results.items() if k in ML_MODELS}
+    dl_results = {k: v for k, v in results.items() if k in DL_MODELS}
+
+    print("\nClassical ML Models:")
+    for m, err in sorted(ml_results.items(), key=lambda x: x[1]):
+        print(f"  {m:15s}: {err:.2f}°")
+
+    if dl_results:
+        print("\nDeep Learning Models:")
+        for m, err in sorted(dl_results.items(), key=lambda x: x[1]):
+            print(f"  {m:15s}: {err:.2f}°")
+
+    print("\n" + "-" * 70)
+    print("Overall Ranking:")
+    for rank, (m, err) in enumerate(sorted(results.items(), key=lambda x: x[1]), 1):
+        model_cat = "DL" if m in DL_MODELS else "ML"
+        print(f"  {rank}. {m:15s} ({model_cat}): {err:.2f}°")
 
     best = min(results, key=results.get)
-    print(f"\nBest model: {best}")
+    best_cat = "Deep Learning" if best in DL_MODELS else "Classical ML"
+    print(f"\nBest model: {best.upper()} ({best_cat}) with {results[best]:.2f}° error")
+
     return best, results
+
+
+def compare_ml_models(training_folder):
+    """Compare only classical ML models (no PyTorch required)."""
+    return compare_all_models(training_folder, include_dl=False)
+
+
+def compare_dl_models(training_folder, epochs=50):
+    """Compare only deep learning models."""
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch required. Install with: pip install torch torchvision")
+
+    print("=" * 70)
+    print("COMPARING DEEP LEARNING MODELS")
+    print("=" * 70)
+
+    predictor = LightDirectionPredictor(img_size=64, n_pca=64)
+    _, Y, groups, object_folders = predictor.load_training_data(training_folder)
+
+    # Get image paths
+    img_paths = []
+    for gid, folder in enumerate(object_folders):
+        imgs = sorted(glob.glob(os.path.join(folder, '*.png')))
+        imgs = [f for f in imgs if 'mask' not in f.lower() and 'normal' not in f.lower()]
+        light_file = os.path.join(folder, 'light_directions.txt')
+        if os.path.exists(light_file):
+            lights = np.loadtxt(light_file)
+            n = min(len(imgs), len(lights))
+            img_paths.extend(imgs[:n])
+
+    results = {}
+    for model_type in DL_MODELS:
+        print(f"\n{'=' * 50}")
+        print(f"Model: {model_type.upper()}")
+        print("=" * 50)
+        errors = predictor.cross_validate(
+            None, Y, groups, model_type=model_type,
+            img_paths=img_paths, epochs=epochs
+        )
+        results[model_type] = errors.mean()
+
+    print("\n" + "=" * 70)
+    print("DEEP LEARNING MODELS SUMMARY")
+    print("=" * 70)
+    for m, err in sorted(results.items(), key=lambda x: x[1]):
+        print(f"  {m:15s}: {err:.2f}°")
+
+    best = min(results, key=results.get)
+    print(f"\nBest DL model: {best.upper()}")
+    return best, results
+
+
+# ==================== TRAIN BEST MODELS ====================
+
+def train_best_ml(training_folder, output_path='./light_predictor_ml_v3.pkl'):
+    """
+    Compare all ML models, train the best one, and save it.
+
+    Workflow:
+    1. Cross-validate all ML models (ridge, rf, gbr, mlp)
+    2. Select the best performing model
+    3. Train it on full dataset
+    4. Save to output_path
+
+    Args:
+        training_folder: Path to training data
+        output_path: Path to save the best ML model
+
+    Returns:
+        predictor: Trained predictor
+        best_model: Name of the best model
+        results: All model comparison results
+    """
+    print("=" * 70)
+    print("ML PIPELINE: Compare → Train Best → Save")
+    print("=" * 70)
+
+    # Step 1: Compare all ML models
+    print("\n" + "=" * 70)
+    print("STEP 1: COMPARING ALL ML MODELS")
+    print("=" * 70)
+
+    best_model, results = compare_ml_models(training_folder)
+
+    # Step 2: Train the best model on full data
+    print("\n" + "=" * 70)
+    print(f"STEP 2: TRAINING BEST ML MODEL ({best_model.upper()}) ON FULL DATA")
+    print("=" * 70)
+
+    predictor = LightDirectionPredictor(img_size=64, n_pca=64)
+    X, Y, groups, _ = predictor.load_training_data(training_folder)
+    predictor.train(X, Y, model_type=best_model)
+
+    # Step 3: Save the model
+    predictor.save(output_path)
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("ML PIPELINE COMPLETE")
+    print("=" * 70)
+    print(f"Best ML model: {best_model.upper()}")
+    print(f"CV Error: {results[best_model]:.2f}°")
+    print(f"Saved to: {output_path}")
+
+    print("\nAll ML Results:")
+    for m, err in sorted(results.items(), key=lambda x: x[1]):
+        marker = "→ BEST" if m == best_model else ""
+        print(f"  {m:10s}: {err:.2f}° {marker}")
+
+    return predictor, best_model, results
+
+
+def train_best_dl(training_folder, output_path='./light_predictor_dl_v3.pkl', epochs=100):
+    """
+    Compare all DL models, train the best one, and save it.
+
+    Workflow:
+    1. Cross-validate all DL models (cnn, resnet, efficientnet)
+    2. Select the best performing model
+    3. Train it on full dataset
+    4. Save to output_path
+
+    Args:
+        training_folder: Path to training data
+        output_path: Path to save the best DL model
+        epochs: Number of training epochs
+
+    Returns:
+        predictor: Trained predictor
+        best_model: Name of the best model
+        results: All model comparison results
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch required. Install with: pip install torch torchvision")
+
+    print("=" * 70)
+    print("DL PIPELINE: Compare → Train Best → Save")
+    print("=" * 70)
+
+    # Step 1: Compare all DL models
+    print("\n" + "=" * 70)
+    print("STEP 1: COMPARING ALL DL MODELS")
+    print("=" * 70)
+
+    best_model, results = compare_dl_models(training_folder, epochs=epochs)
+
+    # Step 2: Train the best model on full data
+    print("\n" + "=" * 70)
+    print(f"STEP 2: TRAINING BEST DL MODEL ({best_model.upper()}) ON FULL DATA")
+    print("=" * 70)
+
+    predictor = LightDirectionPredictor(img_size=64, n_pca=64)
+    X, Y, groups, object_folders = predictor.load_training_data(training_folder)
+
+    # Get image paths for DL training
+    img_paths = []
+    for folder in object_folders:
+        imgs = sorted(glob.glob(os.path.join(folder, '*.png')))
+        imgs = [f for f in imgs if 'mask' not in f.lower() and 'normal' not in f.lower()]
+        light_file = os.path.join(folder, 'light_directions.txt')
+        if os.path.exists(light_file):
+            lights = np.loadtxt(light_file)
+            n = min(len(imgs), len(lights))
+            img_paths.extend(imgs[:n])
+
+    predictor.train(X, Y, model_type=best_model, img_paths=img_paths, epochs=epochs)
+
+    # Step 3: Save the model
+    predictor.save(output_path)
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("DL PIPELINE COMPLETE")
+    print("=" * 70)
+    print(f"Best DL model: {best_model.upper()}")
+    print(f"CV Error: {results[best_model]:.2f}°")
+    print(f"Saved to: {output_path}")
+
+    print("\nAll DL Results:")
+    for m, err in sorted(results.items(), key=lambda x: x[1]):
+        marker = "→ BEST" if m == best_model else ""
+        print(f"  {m:15s}: {err:.2f}° {marker}")
+
+    return predictor, best_model, results
+
 
 # ==================== MAIN SCRIPT ====================
 
 if __name__ == '__main__':
-    TRAINING_FOLDER = './data/training/'
+    import argparse
 
-    # Compare all models to find best
-    best_model, results = compare_all_models(TRAINING_FOLDER)
+    parser = argparse.ArgumentParser(
+        description='Light Direction Predictor - Train and Compare ML/DL Models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Compare and train best ML model
+  python light_direction_predictor.py --mode train_best_ml
 
-    # Train best model
-    print(f"\n{'=' * 60}")
-    print(f"Training final model: {best_model}")
-    print("=" * 60)
+  # Compare and train best DL model
+  python light_direction_predictor.py --mode train_best_dl --epochs 100
 
-    predictor = LightDirectionPredictor(img_size=64, n_pca=64)
-    X, Y, groups, _ = predictor.load_training_data(TRAINING_FOLDER)
-    predictor.train(X, Y, model_type=best_model)
-    predictor.save('./light_predictor_v2.pkl')
+  # Compare all models without training
+  python light_direction_predictor.py --mode compare_all
+
+  # Train a specific model
+  python light_direction_predictor.py --mode train --model resnet --epochs 100
+        """
+    )
+    parser.add_argument('--mode', type=str, default='train_best_ml',
+                        choices=['train_best_ml', 'train_best_dl', 'compare_all', 'compare_ml', 'compare_dl', 'train'],
+                        help='Mode: train_best_ml, train_best_dl, compare_all, compare_ml, compare_dl, or train')
+    parser.add_argument('--model', type=str, default='rf',
+                        choices=ALL_MODELS,
+                        help='Model type (only for --mode train)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs for DL models (default: 100)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output model path (default: auto-generated based on mode)')
+    parser.add_argument('--data', type=str, default='./data/training/',
+                        help='Training data folder')
+
+    args = parser.parse_args()
+
+    TRAINING_FOLDER = args.data
+
+    if args.mode == 'train_best_ml':
+        # RECOMMENDED: Compare all ML models, train the best, save it
+        output_path = args.output or './light_predictor_ml_v3.pkl'
+        predictor, best_model, results = train_best_ml(TRAINING_FOLDER, output_path)
+
+    elif args.mode == 'train_best_dl':
+        # RECOMMENDED: Compare all DL models, train the best, save it
+        output_path = args.output or './light_predictor_dl_v3.pkl'
+        predictor, best_model, results = train_best_dl(TRAINING_FOLDER, output_path, epochs=args.epochs)
+
+    elif args.mode == 'compare_all':
+        # Compare all models (ML + DL) without training
+        best_model, results = compare_all_models(TRAINING_FOLDER, include_dl=True, dl_epochs=args.epochs)
+
+    elif args.mode == 'compare_ml':
+        # Compare only ML models without training
+        best_model, results = compare_ml_models(TRAINING_FOLDER)
+
+    elif args.mode == 'compare_dl':
+        # Compare only DL models without training
+        best_model, results = compare_dl_models(TRAINING_FOLDER, epochs=args.epochs)
+
+    elif args.mode == 'train':
+        # Train specific model
+        print(f"\n{'=' * 70}")
+        print(f"Training {args.model.upper()} model")
+        print("=" * 70)
+
+        predictor = LightDirectionPredictor(img_size=64, n_pca=64)
+        X, Y, groups, object_folders = predictor.load_training_data(TRAINING_FOLDER)
+
+        # Get image paths for DL models
+        if args.model in DL_MODELS:
+            img_paths = []
+            for folder in object_folders:
+                imgs = sorted(glob.glob(os.path.join(folder, '*.png')))
+                imgs = [f for f in imgs if 'mask' not in f.lower() and 'normal' not in f.lower()]
+                light_file = os.path.join(folder, 'light_directions.txt')
+                if os.path.exists(light_file):
+                    lights = np.loadtxt(light_file)
+                    n = min(len(imgs), len(lights))
+                    img_paths.extend(imgs[:n])
+
+            predictor.train(X, Y, model_type=args.model, img_paths=img_paths, epochs=args.epochs)
+        else:
+            predictor.train(X, Y, model_type=args.model)
+
+        predictor.save(args.output)
+        print(f"\nModel saved to: {args.output}")
