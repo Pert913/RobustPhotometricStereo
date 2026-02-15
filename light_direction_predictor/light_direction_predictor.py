@@ -398,7 +398,7 @@ class LightDirectionPredictor:
         print(f"\nTraining {model_type.upper()} model (Deep Learning)...")
 
         # Create DL predictor
-        self.dl_predictor = DeepLightPredictor(model_type=model_type, img_size=128)
+        self.dl_predictor = DeepLightPredictor(model_type=model_type, img_size=224)
 
         # Train
         history = self.dl_predictor.train(
@@ -478,7 +478,7 @@ class LightDirectionPredictor:
         """Cross-validate deep learning model."""
         print(f"\nLeave-One-Object-Out Cross-validating {model_type.upper()} (Deep Learning)...")
 
-        dl_predictor = DeepLightPredictor(model_type=model_type, img_size=128)
+        dl_predictor = DeepLightPredictor(model_type=model_type, img_size=224)
         errors, per_object = dl_predictor.cross_validate(
             img_paths, Y, groups,
             epochs=epochs, batch_size=batch_size, lr=lr, verbose=True
