@@ -18,7 +18,17 @@ pip install numpy scipy scikit-learn pillow
 pip install torch torchvision
 ```
 
-### Compare All Models
+### Recommended Pipelines
+
+```bash
+# Pipeline 1: Compare all ML models → train best → save
+python light_direction_predictor.py --mode train_best_ml
+
+# Pipeline 2: Compare all DL models → train best → save
+python light_direction_predictor.py --mode train_best_dl --epochs 150
+```
+
+### Compare Models (without saving)
 
 ```bash
 # Compare all ML + DL models
@@ -57,40 +67,60 @@ python light_direction_predictor.py --mode train --model cnn --epochs 100 --outp
 | Gradient Boosting | `gbr` | Sequential ensemble learning | Slow | Good |
 | MLP | `mlp` | Multi-layer perceptron (sklearn) | Medium | Good |
 
-### Deep Learning Models (PyTorch)
+### Deep Learning Models (PyTorch) — v3 Gradient Input
 
 | Model | Code | Description | Speed | Accuracy |
 |-------|------|-------------|-------|----------|
-| Custom CNN | `cnn` | 5-layer CNN designed for light estimation | Fast | Better |
-| ResNet18 | `resnet` | Transfer learning from ImageNet | Medium | Best |
-| EfficientNet-B0 | `efficientnet` | Efficient architecture | Medium | Best |
+| Custom CNN | `cnn` | 4-block CNN with gradient input | Fast | Good |
+| ResNet18 | `resnet` | Transfer learning, 3-channel gradient | Medium | Best |
+| EfficientNet-B0 | `efficientnet` | Efficient architecture, gradient input | Medium | Best |
 
 **Note:** DL models require PyTorch. Install with `pip install torch torchvision`
 
 ---
 
-## Deep Learning Architecture Details
+## Deep Learning v3: Key Innovation — 3-Channel Gradient Input
+
+### The Problem (v1)
+
+DL models fed with raw grayscale pixels achieved ~24° CV error — worse than ML models (~10-15°). The reason: **models learned object identity** (texture, shape) instead of lighting patterns. They couldn't generalize to unseen objects.
+
+### The Solution (v3)
+
+Instead of raw grayscale pixels, DL models receive **3-channel gradient-based input**:
+
+```
+Channel 0: Normalized image     (zero mean, unit std)
+Channel 1: Sobel X gradient     (horizontal edges)
+Channel 2: Sobel Y gradient     (vertical edges)
+```
+
+**Why this works:**
+- **Object-invariant**: Gradients encode shading patterns, not object identity
+- **Physics-motivated**: For Lambertian surfaces, image gradients directly relate to light direction
+- **Natural 3-channel**: Pretrained models (ResNet, EfficientNet) expect 3 channels — no conv1 hack needed
+- **Same insight as ML models**: The ML features that work best are gradient-based (gradient histograms, dominant direction)
+
+---
+
+## Architecture Details
 
 ### Custom CNN (`cnn`)
 
 ```
-Input (1, 128, 128)
+Input (3, 224, 224) — [normalized_img, sobel_x, sobel_y]
     ↓
-Conv Block 1: Conv(1→32) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout
+Conv Block 1: Conv(3→32) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout(0.25)
     ↓
-Conv Block 2: Conv(32→64) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout
+Conv Block 2: Conv(32→64) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout(0.25)
     ↓
-Conv Block 3: Conv(64→128) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout
+Conv Block 3: Conv(64→128) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout(0.375)
     ↓
-Conv Block 4: Conv(128→256) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout
+Conv Block 4: Conv(128→256) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout(0.5)
     ↓
-Conv Block 5: Conv(256→512) + BN + ReLU + Conv + BN + ReLU + MaxPool + Dropout
+Global Average Pooling → (256,)
     ↓
-Global Average Pooling
-    ↓
-FC(512→256) + ReLU + Dropout
-    ↓
-FC(256→128) + ReLU + Dropout
+FC(256→128) + BatchNorm1d + ReLU + Dropout(0.5)
     ↓
 FC(128→3) → L2 Normalize
     ↓
@@ -99,28 +129,64 @@ Output: 3D Light Direction (unit vector)
 
 ### ResNet18 Transfer Learning (`resnet`)
 
-- Pretrained on ImageNet (1M+ images)
-- Modified first conv layer for grayscale input
-- Custom head for 3D direction regression
-- Fine-tuned end-to-end
+```
+Input (3, 224, 224) — [normalized_img, sobel_x, sobel_y]
+    ↓
+Pretrained ResNet18 (ImageNet weights)
+  - conv1 uses pretrained 3-channel weights (NO modification needed!)
+  - Phase 1: Freeze layers 1-4, train conv1 + bn1 + head
+  - Phase 2: Unfreeze all, fine-tune with differential LR
+    ↓
+Global Average Pooling → (512,)
+    ↓
+BatchNorm1d(512) + Dropout(0.5) + FC(512→128) + BatchNorm1d + ReLU + Dropout(0.25)
+    ↓
+FC(128→3) → L2 Normalize
+    ↓
+Output: 3D Light Direction (unit vector)
+```
 
 ### EfficientNet-B0 (`efficientnet`)
 
-- State-of-the-art efficient architecture
-- Pretrained on ImageNet
-- Good accuracy/compute tradeoff
+```
+Input (3, 224, 224) — [normalized_img, sobel_x, sobel_y]
+    ↓
+Pretrained EfficientNet-B0 (ImageNet weights)
+  - First conv uses pretrained 3-channel weights (NO modification needed!)
+  - Phase 1: Freeze features[1:], train features[0] + classifier
+  - Phase 2: Unfreeze all with differential LR
+    ↓
+Global Average Pooling → (1280,)
+    ↓
+BatchNorm1d(1280) + Dropout(0.5) + FC(1280→128) + BatchNorm1d + ReLU + Dropout(0.25)
+    ↓
+FC(128→3) → L2 Normalize
+    ↓
+Output: 3D Light Direction (unit vector)
+```
 
 ---
 
-## Data Augmentation (DL Models)
+## Data Augmentation (DL Models v3)
 
-For small datasets, augmentation is critical:
+For small datasets (960 images), augmentation is critical. v3 uses **physics-aware** augmentations:
 
-- **Random Horizontal Flip** (with light direction flip)
-- **Random Rotation** (±15°)
-- **Brightness/Contrast Jitter**
-- **Gaussian Blur** (p=0.3)
-- **Image Normalization** (ImageNet stats)
+| Augmentation | Details | Why |
+|-------------|---------|-----|
+| **Random Crop** | Resize to 256, crop to 224 | Position invariance |
+| **Horizontal Flip** | With label correction: negate `light[0]` | Doubles data correctly |
+| **Brightness/Contrast Jitter** | ×0.8-1.2 | Removed by per-image normalization |
+| **Random Erasing** | Zero out random rectangle (p=0.3) | Prevents learning object shape |
+| **Mixup** | Blend images + labels (α=0.4) | Prevents memorizing objects |
+
+**Important**: No random rotation (would require complex 3D light direction correction).
+
+**Label correction for horizontal flip:**
+```python
+if flip:
+    image = mirror(image)
+    light[0] = -light[0]  # Negate x-component
+```
 
 ---
 
@@ -128,22 +194,37 @@ For small datasets, augmentation is critical:
 
 ### Loss Function
 
-Combined loss for better convergence:
+Combined Angular + MSE loss:
 ```
-Loss = 0.7 × CosineLoss + 0.3 × MSELoss
+Loss = 0.7 × AngularLoss + 0.3 × MSELoss
+
+AngularLoss = mean(arccos(cos_sim(pred, target)))  # in radians
 ```
+
+### 2-Phase Transfer Learning (ResNet, EfficientNet)
+
+| Phase | Trainable | LR | Epochs | Purpose |
+|-------|-----------|-----|--------|---------|
+| Phase 1 | Head + conv1/bn1 | lr × 10 | epochs/3 | Adapt to gradient input |
+| Phase 2 | All layers | backbone: lr×0.1, head: lr | remaining | Fine-tune features |
 
 ### Optimization
 
-- **Optimizer:** AdamW with weight decay
-- **LR Schedule:** Cosine annealing
-- **Early Stopping:** Patience=20 epochs
+| Feature | Value |
+|---------|-------|
+| **Optimizer** | AdamW, weight_decay=5e-4 |
+| **LR Schedule** | Cosine annealing to 1e-6 |
+| **Gradient Clipping** | max_norm=1.0 |
+| **Early Stopping** | Patience=15-25 epochs |
+| **Dropout** | 0.5 (higher than v1 for regularization) |
+| **Mixup** | α=0.4, applied 50% of batches |
 
 ### Cross-Validation
 
-Leave-One-Object-Out (LOGO) for unbiased evaluation:
-- Train on 9 objects, test on 1
-- Repeat for all 10 objects
+Leave-One-Object-Out (LOGO) with **proper training per fold**:
+- Each fold has internal val split (12%) for early stopping
+- 2-phase training applied within each fold
+- Mixup augmentation within each fold
 - Reports per-object and overall error
 
 ---
@@ -248,7 +329,8 @@ Since the output is a unit vector:
 #### Loss Functions
 
 - **MSE** between predicted and GT direction, or
-- **Cosine loss:** $1 - \cos(\theta) = 1 - \text{dot product}$ (preferred)
+- **Angular loss:** $\arccos(\cos(\theta))$ in radians (preferred for v3)
+- **Combined:** 0.7 × Angular + 0.3 × MSE
 
 ---
 
