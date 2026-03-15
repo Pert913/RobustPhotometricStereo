@@ -30,9 +30,7 @@ from model import get_model
 from utils import normal_to_rgb, load_checkpoint, detect_model_type, count_parameters
 
 
-# ═══════════════════════════════════════════════════════════════════
 # Photometric Stereo prediction (multi-image -> normal map)
-# ═══════════════════════════════════════════════════════════════════
 
 def load_images(input_dir=None, image_paths=None, max_images=96):
     """Load grayscale images. Returns (N, H, W) float32 [0, 1]."""
