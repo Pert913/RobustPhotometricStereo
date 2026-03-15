@@ -11,6 +11,9 @@ Usage:
 
     # Predict from specific image files
     python predict.py --checkpoint checkpoints/train/best.pt --images img1.png img2.png img3.png --output ./output/
+
+    # Predict for all images in folder ( Tue, highly recommended to use that)
+    python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
 """
 import argparse
 import os

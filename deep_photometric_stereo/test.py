@@ -1,18 +1,33 @@
 """
-Evaluation / inference script for UNetPS.
+Evaluation / inference script for TransUNetPS.
 
 Usage:
-    # Evaluate a trained checkpoint on a test object
-    python test.py --checkpoint checkpoints/logo_ballPNG/best.pt --test_object ballPNG
+    # Evaluate ONE checkpoint on ALL test objects (recommended)
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/training
+
+    # Evaluate on a single test object
+    python test.py --mode eval --checkpoint checkpoints/train/best.pt --test_object ballPNG
 
     # Evaluate and save predicted normal maps
-    python test.py --checkpoint checkpoints/logo_ballPNG/best.pt --test_object ballPNG --save_output ./output
+    python test.py --mode eval --checkpoint checkpoints/train/best.pt --test_object ballPNG --save_output ./output
 
     # Run on all objects (using LOGO checkpoints)
     python test.py --mode logo_eval --checkpoint_dir checkpoints/
+
+    # Test on ALL training objects (10 objects)
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/training
+
+    # Test on ALL testing objects (5 objects)
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing
+
+    # Test on BOTH training + testing, save output images
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/training --save_output ./output/training
+    python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing --save_output ./output/testing
 """
 import argparse
 import os
+import glob
 import numpy as np
 import torch
 from PIL import Image
@@ -32,7 +47,7 @@ def predict_full_resolution(model, images, device, tile_size=128, max_images=96)
     Predict normal map for full-resolution images using tiling.
 
     Args:
-        model: UNetPS model
+        model: TransUNetPS or LightweightUNetPS model
         images: (N, 1, H, W) tensor
         device: torch device
         tile_size: tile size for processing
@@ -87,7 +102,7 @@ def evaluate_object(model, test_ds, obj_idx, device, save_dir=None):
     images, normal_gt, mask, obj_name = test_ds[obj_idx]
     N, C, H, W = images.shape
 
-    print(f"\nEvaluating: {obj_name} ({N} images, {H}×{W})")
+    print(f"\nEvaluating: {obj_name} ({N} images, {H}x{W})")
 
     # Predict
     pred_normal = predict_full_resolution(model, images, device)
@@ -102,12 +117,12 @@ def evaluate_object(model, test_ds, obj_idx, device, save_dir=None):
 
     # Statistics
     valid_errors = err_map[mask_np > 0.5]
-    print(f"  Mean Angular Error: {mae:.2f}°")
-    print(f"  Median Error:       {np.median(valid_errors):.2f}°")
-    print(f"  Max Error:          {np.max(valid_errors):.2f}°")
-    print(f"  <10° pixels:        {(valid_errors < 10).mean() * 100:.1f}%")
-    print(f"  <20° pixels:        {(valid_errors < 20).mean() * 100:.1f}%")
-    print(f"  <30° pixels:        {(valid_errors < 30).mean() * 100:.1f}%")
+    print(f"  Mean Angular Error: {mae:.2f}")
+    print(f"  Median Error:       {np.median(valid_errors):.2f}")
+    print(f"  Max Error:          {np.max(valid_errors):.2f}")
+    print(f"  <10 pixels:         {(valid_errors < 10).mean() * 100:.1f}%")
+    print(f"  <20 pixels:         {(valid_errors < 20).mean() * 100:.1f}%")
+    print(f"  <30 pixels:         {(valid_errors < 30).mean() * 100:.1f}%")
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -120,7 +135,7 @@ def evaluate_object(model, test_ds, obj_idx, device, save_dir=None):
         gt_rgb = normal_to_rgb(gt_np * mask_np[..., None])
         Image.fromarray(gt_rgb).save(os.path.join(save_dir, f"{obj_name}_gt_normal.png"))
 
-        # Save error map as grayscale (scaled 0-90°)
+        # Save error map as grayscale (scaled 0-90)
         err_vis = (err_map / 90.0 * 255).clip(0, 255).astype(np.uint8)
         Image.fromarray(err_vis).save(os.path.join(save_dir, f"{obj_name}_error_map.png"))
 
@@ -132,42 +147,51 @@ def evaluate_object(model, test_ds, obj_idx, device, save_dir=None):
     return mae
 
 
+def discover_objects(data_root):
+    """Find all object directories that have Normal_gt.npy (prepared data)."""
+    objects = []
+    if not os.path.isdir(data_root):
+        return objects
+    for name in sorted(os.listdir(data_root)):
+        obj_dir = os.path.join(data_root, name)
+        if not os.path.isdir(obj_dir):
+            continue
+        # Must have Normal_gt.npy (from prepare_data.py) and some images
+        if os.path.exists(os.path.join(obj_dir, "Normal_gt.npy")):
+            objects.append(name)
+    return objects
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate UNetPS")
-    parser.add_argument("--mode", type=str, default="eval",
-                        choices=["eval", "logo_eval"],
-                        help="Evaluation mode")
+    parser = argparse.ArgumentParser(description="Evaluate TransUNetPS")
+    parser.add_argument("--mode", type=str, default="eval_all",
+                        choices=["eval", "eval_all", "logo_eval"],
+                        help="eval: single object, eval_all: all objects in data_root, logo_eval: LOGO folds")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to checkpoint file (for --mode eval)")
+                        help="Path to checkpoint file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
                         help="Checkpoint directory (for --mode logo_eval)")
     parser.add_argument("--test_object", type=str, default=None,
-                        help="Object to evaluate on")
-    parser.add_argument("--data_root", type=str, default="./data/training")
+                        help="Object to evaluate on (for --mode eval)")
+    parser.add_argument("--data_root", type=str, default="./data/training",
+                        help="Directory containing test objects")
     parser.add_argument("--save_output", type=str, default=None,
                         help="Directory to save prediction outputs")
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--model_type", type=str, default="transunet",
-                        choices=["transunet", "lightweight"],
-                        help="Model architecture")
     args = parser.parse_args()
 
-    config = Config(
-        data=DataConfig(data_root=os.path.abspath(args.data_root)),
-        model=ModelConfig(model_type=args.model_type),
-        device=args.device,
-    )
+    config = Config(device=args.device)
     device = config.resolve_device()
 
+    # ── eval: single object ──────────────────────────────────────────
     if args.mode == "eval":
         if not args.checkpoint:
-            print("ERROR: --checkpoint required for eval mode")
+            print("ERROR: --checkpoint required")
             return
         if not args.test_object:
-            print("ERROR: --test_object required for eval mode")
+            print("ERROR: --test_object required for --mode eval")
             return
 
-        # Load model (auto-detect model_type from checkpoint)
         mt = detect_model_type(args.checkpoint)
         print(f"Auto-detected model_type: {mt}")
         model = get_model(config.model, model_type=mt).to(device)
@@ -175,9 +199,8 @@ def main():
         print(f"Loaded checkpoint from epoch {epoch} (val_loss={val_loss:.4f})")
         print(f"Parameters: {count_parameters(model):,}")
 
-        # Load test data
         test_ds = DiLiGentTestDataset(
-            data_root=config.data.data_root,
+            data_root=os.path.abspath(args.data_root),
             objects=[args.test_object],
         )
 
@@ -187,8 +210,65 @@ def main():
 
         evaluate_object(model, test_ds, 0, device, save_dir=args.save_output)
 
+    # ── eval_all: one checkpoint, all objects in data_root ───────────
+    elif args.mode == "eval_all":
+        if not args.checkpoint:
+            print("ERROR: --checkpoint required")
+            return
+
+        data_root = os.path.abspath(args.data_root)
+        objects = discover_objects(data_root)
+        if not objects:
+            print(f"ERROR: No prepared objects found in {data_root}")
+            print("  (Each object needs Normal_gt.npy — run prepare_data.py first)")
+            return
+
+        mt = detect_model_type(args.checkpoint)
+        print(f"Auto-detected model_type: {mt}")
+        model = get_model(config.model, model_type=mt).to(device)
+        epoch, val_loss = load_checkpoint(args.checkpoint, model)
+        print(f"Loaded checkpoint from epoch {epoch} (val_loss={val_loss:.4f})")
+        print(f"Parameters: {count_parameters(model):,}")
+        print(f"Data root: {data_root}")
+        print(f"Objects found: {len(objects)} — {objects}")
+
+        all_results = {}
+        for obj_name in objects:
+            test_ds = DiLiGentTestDataset(
+                data_root=data_root,
+                objects=[obj_name],
+            )
+            if len(test_ds) == 0:
+                print(f"\n  WARNING: Could not load {obj_name}, skipping")
+                continue
+
+            save_dir = os.path.join(args.save_output, obj_name) if args.save_output else None
+            mae = evaluate_object(model, test_ds, 0, device, save_dir=save_dir)
+            all_results[obj_name] = mae
+
+        # Print summary table
+        if all_results:
+            print(f"\n{'='*60}")
+            print(f"  Evaluation Summary — {len(all_results)} objects")
+            print(f"  Checkpoint: {args.checkpoint}")
+            print(f"  Data root:  {data_root}")
+            print(f"{'='*60}")
+            for obj, mae in all_results.items():
+                print(f"  {obj:>20s}: {mae:.2f}")
+            avg = np.mean(list(all_results.values()))
+            median = np.median(list(all_results.values()))
+            best_obj = min(all_results, key=all_results.get)
+            worst_obj = max(all_results, key=all_results.get)
+            print(f"  {'':>20s}  --------")
+            print(f"  {'Average':>20s}: {avg:.2f}")
+            print(f"  {'Median':>20s}: {median:.2f}")
+            print(f"  {'Best':>20s}: {all_results[best_obj]:.2f} ({best_obj})")
+            print(f"  {'Worst':>20s}: {all_results[worst_obj]:.2f} ({worst_obj})")
+            print(f"{'='*60}")
+
+    # ── logo_eval: one checkpoint per fold ───────────────────────────
     elif args.mode == "logo_eval":
-        # Evaluate all LOGO folds
+        data_root = os.path.abspath(args.data_root)
         objects = config.data.objects
         all_results = {}
 
@@ -203,7 +283,7 @@ def main():
             load_checkpoint(ckpt_path, model)
 
             test_ds = DiLiGentTestDataset(
-                data_root=config.data.data_root,
+                data_root=data_root,
                 objects=[test_obj],
             )
             if len(test_ds) == 0:
@@ -218,9 +298,10 @@ def main():
             print("  LOGO Evaluation Summary")
             print(f"{'='*50}")
             for obj, mae in all_results.items():
-                print(f"  {obj:>10s}: {mae:.2f}°")
+                print(f"  {obj:>20s}: {mae:.2f}")
             avg = np.mean(list(all_results.values()))
-            print(f"  {'Average':>10s}: {avg:.2f}°")
+            print(f"  {'Average':>20s}: {avg:.2f}")
+            print(f"{'='*50}")
 
 
 if __name__ == "__main__":

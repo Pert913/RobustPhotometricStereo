@@ -30,6 +30,24 @@ Usage:
       --test_object bootaoPNG \
       --model_type transunet \
       --epochs 150
+
+    # Tue, you can use this command to train if your computer is good enough (using exactly TransUnet in the Paper)
+    python train.py --mode train \
+      --train_objects ballPNG bearPNG buddhaPNG catPNG cowPNG gobletPNG harvestPNG pot1PNG pot2PNG readingPNG \
+      --test_object ballPNG \
+      --model_type transunet \
+      --epochs 150 \
+      --batch_size 4 \
+      --patches_per_epoch 2000
+
+    # OR Lightweight model (faster, ~4.6M params)
+    python train.py --mode train \
+          --train_objects ballPNG bearPNG buddhaPNG catPNG cowPNG gobletPNG harvestPNG pot1PNG pot2PNG readingPNG \
+          --test_object ballPNG \
+          --model_type lightweight \
+          --epochs 150 \
+          --batch_size 4 \
+          --patches_per_epoch 2000
 """
 import argparse
 import os
