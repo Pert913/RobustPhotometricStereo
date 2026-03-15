@@ -1,7 +1,7 @@
 """
 DiLiGenT dataset for uncalibrated photometric stereo.
 
-Each sample: N grayscale images of one object → normal map ground truth.
+Each sample: N grayscale images of one object ---> normal map ground truth.
 Training uses random patches; testing uses full resolution.
 """
 import os

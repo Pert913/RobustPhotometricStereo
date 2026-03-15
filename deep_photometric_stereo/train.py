@@ -10,6 +10,26 @@ Usage:
 
     # Quick test run
     python train.py --mode train --epochs 5 --patches_per_epoch 100
+
+    # Train (TransUNet model — default)
+    python train.py --mode logo_cv --epochs 150
+
+    # Train (Lightweight model — faster, smaller)
+    python train.py --mode logo_cv --epochs 200 --model_type lightweight
+
+    # General training command using our approach UNet-Transformer ( lightweight model, 150 epochs)
+    python train.py --mode train \
+      --train_objects ballPNG bearPNG buddhaPNG catPNG cowPNG gobletPNG harvestPNG pot1PNG pot2PNG readingPNG \
+      --test_object bootaoPNG \
+      --model_type lightweight \
+      --epochs 150
+
+    # General training command using exactly TransUnet in the Paper
+    python train.py --mode train \
+      --train_objects ballPNG bearPNG buddhaPNG catPNG cowPNG gobletPNG harvestPNG pot1PNG pot2PNG readingPNG \
+      --test_object bootaoPNG \
+      --model_type transunet \
+      --epochs 150
 """
 import argparse
 import os
@@ -222,7 +242,8 @@ def train_fold(
                 best_epoch = epoch
                 patience_counter = 0
                 ckpt_path = os.path.join(save_dir, "best.pt")
-                save_checkpoint(model, optimizer, epoch, mae, ckpt_path)
+                save_checkpoint(model, optimizer, epoch, mae, ckpt_path,
+                                model_type=config.model.model_type)
                 print(f"  ★ New best: {mae:.2f}° (saved)")
             else:
                 patience_counter += 10

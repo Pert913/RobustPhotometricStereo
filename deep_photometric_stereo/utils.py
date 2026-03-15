@@ -41,7 +41,7 @@ def mean_angular_error(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> fl
 def normal_to_rgb(normal: np.ndarray) -> np.ndarray:
     """
     Convert normal map to RGB visualization.
-    Maps [-1,1] → [0,255] for each channel.
+    Maps [-1,1] ---> [0,255] for each channel.
 
     Args:
         normal: (H, W, 3) unit normal vectors
@@ -53,14 +53,15 @@ def normal_to_rgb(normal: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, path):
-    """Save model checkpoint."""
+def save_checkpoint(model, optimizer, epoch, val_loss, path, model_type=None):
+    """Save model checkpoint with model_type for auto-detection on load."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "val_loss": val_loss,
+        "model_type": model_type or type(model).__name__,
     }, path)
 
 
@@ -71,6 +72,24 @@ def load_checkpoint(path, model, optimizer=None):
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     return ckpt.get("epoch", 0), ckpt.get("val_loss", float("inf"))
+
+
+def detect_model_type(path):
+    """Detect model_type from a checkpoint file. Returns 'transunet' or 'lightweight'."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    # Check saved model_type field
+    saved = ckpt.get("model_type", "")
+    if "Lightweight" in saved or saved == "lightweight":
+        return "lightweight"
+    if "TransUNet" in saved or saved == "transunet":
+        return "transunet"
+    # Fallback: detect from state_dict keys
+    keys = list(ckpt.get("model_state_dict", {}).keys())
+    if any(k.startswith("enc1.") for k in keys):
+        return "lightweight"
+    if any(k.startswith("encoder.enc1.") for k in keys):
+        return "transunet"
+    return "transunet"  # default
 
 
 def count_parameters(model) -> int:

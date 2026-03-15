@@ -1,10 +1,10 @@
 """
 Configuration for TransUNetPS.
 
-Aligned with TransUNet (Chen et al., Medical Image Analysis, 2024).
+We did it to align with TransUNet (Chen et al., Medical Image Analysis, 2024).
 """
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 @dataclass

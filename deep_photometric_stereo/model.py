@@ -15,11 +15,11 @@ Architecture (Encoder-only configuration):
 
 Key alignment with TransUNet source code:
     - Attention class: query/key/value projections, scaled dot-product (vit_seg_modeling.py:50-94)
-    - Mlp class: fc1 → GELU → dropout → fc2 → dropout (vit_seg_modeling.py:97-119)
+    - Mlp class: fc1 ---> GELU ---> dropout ---> fc2 ---> dropout (vit_seg_modeling.py:97-119)
     - Block class: pre-LayerNorm, MSA + residual, MLP + residual (vit_seg_modeling.py:168-224)
     - Encoder: stack of Blocks + final LayerNorm (vit_seg_modeling.py:227-244)
-    - DecoderCup: Conv2dReLU head → DecoderBlocks with skip connections (vit_seg_modeling.py:326-367)
-    - DecoderBlock: Upsample → Cat(skip) → Conv2dReLU × 2 (vit_seg_modeling.py:284-315)
+    - DecoderCup: Conv2dReLU head ---> DecoderBlocks with skip connections (vit_seg_modeling.py:326-367)
+    - DecoderBlock: Upsample ---> Cat(skip) ---> Conv2dReLU × 2 (vit_seg_modeling.py:284-315)
 """
 import torch
 import torch.nn as nn
@@ -28,9 +28,7 @@ import math
 import copy
 
 
-# ══════════════════════════════════════════════════════════════════════
 # Transformer Components (following TransUNet vit_seg_modeling.py)
-# ══════════════════════════════════════════════════════════════════════
 
 class Attention(nn.Module):
     """
@@ -77,7 +75,7 @@ class Attention(nn.Module):
 class Mlp(nn.Module):
     """
     MLP block (TransUNet vit_seg_modeling.py:97-119).
-    fc1 → GELU → dropout → fc2 → dropout
+    fc1 ---> GELU ---> dropout ---> fc2 ---> dropout
     """
 
     def __init__(self, hidden_size, mlp_dim, dropout_rate=0.1):
@@ -258,9 +256,7 @@ class SharedEncoder(nn.Module):
         return [e1, e2, e3, e4], bottleneck
 
 
-# ══════════════════════════════════════════════════════════════════════
 # Multi-Scale Fusion (our contribution for photometric stereo)
-# ══════════════════════════════════════════════════════════════════════
 
 class MultiScaleFusion(nn.Module):
     """Max-pool across N images at each encoder scale + bottleneck."""
@@ -293,14 +289,12 @@ class MultiScaleFusion(nn.Module):
         return fused[:-1], fused[-1]  # skips, bottleneck
 
 
-# ══════════════════════════════════════════════════════════════════════
 # CNN Decoder (Part II) — following TransUNet DecoderCup
-# ══════════════════════════════════════════════════════════════════════
 
 class DecoderBlock(nn.Module):
     """
     Decoder block (TransUNet vit_seg_modeling.py:284-315).
-    Upsample → Cat(skip) → Conv2dReLU × 2
+    Upsample ---> Cat(skip) ---> Conv2dReLU × 2
     """
 
     def __init__(self, in_ch, skip_ch, out_ch):
@@ -351,11 +345,11 @@ class DecoderCup(nn.Module):
             h, w: spatial dims of bottleneck
         """
         B = hidden_states.shape[0]
-        # Reshape tokens to spatial: (B, seq_len, hidden) → (B, hidden, h, w)
+        # Reshape tokens to spatial: (B, seq_len, hidden) ---> (B, hidden, h, w)
         x = hidden_states.permute(0, 2, 1).contiguous().view(B, -1, h, w)
         x = self.conv_more(x)
 
-        # Reverse skips for decoder (highest resolution last → first)
+        # Reverse skips for decoder (highest resolution last ---> first)
         skips = list(reversed(skips)) if skips else []
 
         for i, block in enumerate(self.blocks):
@@ -365,12 +359,10 @@ class DecoderCup(nn.Module):
         return x
 
 
-# ══════════════════════════════════════════════════════════════════════
 # Output Heads
-# ══════════════════════════════════════════════════════════════════════
 
 class NormalHead(nn.Module):
-    """Normal map prediction: Conv → L2 normalize."""
+    """Normal map prediction: Conv ---> L2 normalize."""
 
     def __init__(self, in_ch, out_ch=3):
         super().__init__()
@@ -393,9 +385,7 @@ class SegmentationHead(nn.Module):
         return self.up(self.conv(x))
 
 
-# ══════════════════════════════════════════════════════════════════════
 # TransUNetPS — Main Model
-# ══════════════════════════════════════════════════════════════════════
 
 class TransUNetPS(nn.Module):
     """
@@ -430,7 +420,7 @@ class TransUNetPS(nn.Module):
         # Multi-scale fusion (for photometric stereo with N images)
         self.fusion = MultiScaleFusion()
 
-        # Patch embedding: CNN bottleneck → Transformer tokens
+        # Patch embedding: CNN bottleneck ---> Transformer tokens
         self.embeddings = Embeddings(
             in_channels=enc_ch[-1],  # bottleneck channels
             hidden_size=hidden_size,
@@ -722,9 +712,9 @@ class LightweightUNetPS(nn.Module):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-# ══════════════════════════════════════════════════════════════════════
+#======
 # Factory function — selects model by type
-# ══════════════════════════════════════════════════════════════════════
+#======
 
 # Backward compatibility alias
 UNetPS = TransUNetPS

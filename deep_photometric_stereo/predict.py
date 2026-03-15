@@ -4,6 +4,7 @@ Predict normal maps from input images using a trained TransUNetPS model.
 Usage:
     # Predict from a folder of images
     python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./my_images/ --output ./output/
+    python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
 
     # Predict with specific number of images
     python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./my_images/ --max_images 32
@@ -20,7 +21,7 @@ from PIL import Image
 
 from config import Config, ModelConfig
 from model import get_model
-from utils import normal_to_rgb, load_checkpoint, count_parameters
+from utils import normal_to_rgb, load_checkpoint, detect_model_type, count_parameters
 
 
 def load_images(input_dir=None, image_paths=None, max_images=96):
@@ -179,9 +180,10 @@ def main():
     device = config.resolve_device()
     print(f"Device: {device}")
 
-    # Load model
-    config.model.model_type = args.model_type
-    model = get_model(config.model, model_type=args.model_type).to(device)
+    # Load model (auto-detect model_type from checkpoint)
+    mt = detect_model_type(args.checkpoint)
+    print(f"Auto-detected model_type: {mt}")
+    model = get_model(config.model, model_type=mt).to(device)
     epoch, val_loss = load_checkpoint(args.checkpoint, model)
     print(f"Loaded checkpoint: epoch={epoch}, val_loss={val_loss:.4f}")
     print(f"Parameters: {count_parameters(model):,}")

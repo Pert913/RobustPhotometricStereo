@@ -3,10 +3,10 @@ Evaluation / inference script for UNetPS.
 
 Usage:
     # Evaluate a trained checkpoint on a test object
-    python test.py --checkpoint checkpoints/logo_cat/best.pt --test_object cat
+    python test.py --checkpoint checkpoints/logo_ballPNG/best.pt --test_object ballPNG
 
     # Evaluate and save predicted normal maps
-    python test.py --checkpoint checkpoints/logo_cat/best.pt --test_object cat --save_output ./output
+    python test.py --checkpoint checkpoints/logo_ballPNG/best.pt --test_object ballPNG --save_output ./output
 
     # Run on all objects (using LOGO checkpoints)
     python test.py --mode logo_eval --checkpoint_dir checkpoints/
@@ -21,7 +21,7 @@ from config import Config, DataConfig, ModelConfig
 from dataset import DiLiGentTestDataset
 from model import get_model
 from utils import (
-    mean_angular_error, angular_error_map, load_checkpoint,
+    mean_angular_error, angular_error_map, load_checkpoint, detect_model_type,
     count_parameters, normal_to_rgb,
 )
 
@@ -167,8 +167,10 @@ def main():
             print("ERROR: --test_object required for eval mode")
             return
 
-        # Load model
-        model = get_model(config.model, model_type=args.model_type).to(device)
+        # Load model (auto-detect model_type from checkpoint)
+        mt = detect_model_type(args.checkpoint)
+        print(f"Auto-detected model_type: {mt}")
+        model = get_model(config.model, model_type=mt).to(device)
         epoch, val_loss = load_checkpoint(args.checkpoint, model)
         print(f"Loaded checkpoint from epoch {epoch} (val_loss={val_loss:.4f})")
         print(f"Parameters: {count_parameters(model):,}")
@@ -196,7 +198,8 @@ def main():
                 print(f"WARNING: No checkpoint for {test_obj} at {ckpt_path}")
                 continue
 
-            model = get_model(config.model, model_type=args.model_type).to(device)
+            mt = detect_model_type(ckpt_path)
+            model = get_model(config.model, model_type=mt).to(device)
             load_checkpoint(ckpt_path, model)
 
             test_ds = DiLiGentTestDataset(
