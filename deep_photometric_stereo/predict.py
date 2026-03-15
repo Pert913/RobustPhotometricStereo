@@ -1,19 +1,22 @@
 """
-Predict normal maps from input images using a trained TransUNetPS model.
+Predict using trained TransUNetPS models.
+
+Supports two modes:
+  - normal (default): Multi-image photometric stereo -> normal map
+  - synapse: Single image segmentation -> organ mask
 
 Usage:
-    # Predict from a folder of images
-    python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./my_images/ --output ./output/
+    # Photometric stereo: predict normal map from folder of images
     python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
 
-    # Predict with specific number of images
-    python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./my_images/ --max_images 32
-
-    # Predict from specific image files
+    # Photometric stereo: predict from specific image files
     python predict.py --checkpoint checkpoints/train/best.pt --images img1.png img2.png img3.png --output ./output/
 
-    # Predict for all images in folder ( Tue, highly recommended to use that)
-    python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
+    # Synapse: segment a single CT slice
+    python predict.py --mode synapse --checkpoint checkpoints/synapse/best.pt --input image.png --output ./output/
+
+    # Synapse: segment all slices in a folder
+    python predict.py --mode synapse --checkpoint checkpoints/synapse/best.pt --input_dir ./ct_slices/ --output ./output/
 """
 import argparse
 import os
@@ -27,15 +30,15 @@ from model import get_model
 from utils import normal_to_rgb, load_checkpoint, detect_model_type, count_parameters
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Photometric Stereo prediction (multi-image -> normal map)
+# ═══════════════════════════════════════════════════════════════════
+
 def load_images(input_dir=None, image_paths=None, max_images=96):
-    """
-    Load grayscale images from a directory or list of paths.
-    Returns numpy array (N, H, W) float32 [0, 1].
-    """
+    """Load grayscale images. Returns (N, H, W) float32 [0, 1]."""
     if image_paths:
         paths = image_paths
     elif input_dir:
-        # Collect all image files
         extensions = ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp"]
         paths = []
         for ext in extensions:
@@ -77,11 +80,7 @@ def load_images(input_dir=None, image_paths=None, max_images=96):
 
 def normalize_images(images, mask=None):
     """Per-image zero-mean, unit-std normalization within mask."""
-    if mask is not None:
-        mask_bool = mask > 0.5
-    else:
-        mask_bool = np.ones(images.shape[1:], dtype=bool)
-
+    mask_bool = mask > 0.5 if mask is not None else np.ones(images.shape[1:], dtype=bool)
     for i in range(images.shape[0]):
         if mask_bool.any():
             m = images[i][mask_bool].mean()
@@ -91,24 +90,11 @@ def normalize_images(images, mask=None):
 
 
 @torch.no_grad()
-def predict(model, images, device, tile_size=128, max_images=96):
-    """
-    Predict normal map from multiple images using tiling.
-
-    Args:
-        model: trained TransUNetPS
-        images: (N, H, W) numpy array
-        device: torch device
-        tile_size: spatial tile size for processing
-        max_images: max images to use per tile
-
-    Returns:
-        pred_normal: (H, W, 3) numpy array
-    """
+def predict_normal(model, images, device, tile_size=128, max_images=96):
+    """Predict normal map from multiple images using tiling."""
     model.eval()
     N, H, W = images.shape
 
-    # Pad to be divisible by 16
     pad_h = (16 - H % 16) % 16
     pad_w = (16 - W % 16) % 16
     if pad_h > 0 or pad_w > 0:
@@ -116,11 +102,8 @@ def predict(model, images, device, tile_size=128, max_images=96):
 
     _, pH, pW = images.shape
     pred_normal = np.zeros((3, pH, pW), dtype=np.float32)
-
-    # Ensure tile_size is divisible by 16
     tile_size = max(16, (tile_size // 16) * 16)
 
-    # Subsample N if too many
     if N > max_images:
         indices = np.linspace(0, N - 1, max_images).astype(int)
         images_sub = images[indices]
@@ -139,51 +122,23 @@ def predict(model, images, device, tile_size=128, max_images=96):
             x_end = min(x + tile_size, pW)
 
             tile = images_sub[:, y:y_end, x:x_end]
-            tile_tensor = torch.from_numpy(tile).float().unsqueeze(1).unsqueeze(0)  # (1, N, 1, th, tw)
-            tile_tensor = tile_tensor.to(device)
+            tile_tensor = torch.from_numpy(tile).float().unsqueeze(1).unsqueeze(0).to(device)
             counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
-            pred_tile = model(tile_tensor, counts)  # (1, 3, th, tw)
+            pred_tile = model(tile_tensor, counts)
             pred_normal[:, y:y_end, x:x_end] = pred_tile[0].cpu().numpy()
 
             tile_idx += 1
             if tile_idx % 10 == 0 or tile_idx == total_tiles:
                 print(f"  Tile {tile_idx}/{total_tiles}")
 
-    # Remove padding
     pred_normal = pred_normal[:, :H, :W]
     return pred_normal.transpose(1, 2, 0)  # (H, W, 3)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Predict normal maps with TransUNetPS")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to trained model checkpoint")
-    parser.add_argument("--input_dir", type=str, default=None,
-                        help="Directory containing input images")
-    parser.add_argument("--images", nargs="+", default=None,
-                        help="Specific image file paths")
-    parser.add_argument("--mask", type=str, default=None,
-                        help="Optional mask image (foreground region)")
-    parser.add_argument("--output", type=str, default="./output",
-                        help="Output directory")
-    parser.add_argument("--max_images", type=int, default=96,
-                        help="Maximum number of images to use")
-    parser.add_argument("--tile_size", type=int, default=128,
-                        help="Tile size for processing (must be divisible by 16)")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device: auto, cuda, mps, cpu")
-    parser.add_argument("--model_type", type=str, default="transunet",
-                        choices=["transunet", "lightweight"],
-                        help="Model architecture: transunet (~11M) or lightweight (~4.7M)")
-    args = parser.parse_args()
-
-    # Resolve device
+def run_normal_prediction(args, device):
+    """Run photometric stereo prediction."""
     config = Config(device=args.device)
-    device = config.resolve_device()
-    print(f"Device: {device}")
-
-    # Load model (auto-detect model_type from checkpoint)
     mt = detect_model_type(args.checkpoint)
     print(f"Auto-detected model_type: {mt}")
     model = get_model(config.model, model_type=mt).to(device)
@@ -191,52 +146,200 @@ def main():
     print(f"Loaded checkpoint: epoch={epoch}, val_loss={val_loss:.4f}")
     print(f"Parameters: {count_parameters(model):,}")
 
-    # Load images
-    images = load_images(
-        input_dir=args.input_dir,
-        image_paths=args.images,
-        max_images=args.max_images,
-    )
+    images = load_images(input_dir=args.input_dir, image_paths=args.images, max_images=args.max_images)
 
-    # Load mask if provided
     mask = None
     if args.mask and os.path.exists(args.mask):
         mask = np.array(Image.open(args.mask).convert("L")).astype(np.float32)
         mask = (mask > 128).astype(np.float32)
         print(f"Mask loaded: shape={mask.shape}, foreground={int(mask.sum())}")
 
-    # Normalize images
     images = normalize_images(images, mask)
+    pred_normal = predict_normal(model, images, device, tile_size=args.tile_size)
 
-    # Predict
-    pred_normal = predict(model, images, device, tile_size=args.tile_size)
-
-    # Apply mask if provided
     if mask is not None:
         pred_normal = pred_normal * mask[..., None]
 
     # Save outputs
     os.makedirs(args.output, exist_ok=True)
 
-    # Save as .npy
     npy_path = os.path.join(args.output, "predicted_normal.npy")
     np.save(npy_path, pred_normal)
     print(f"Saved: {npy_path} (shape={pred_normal.shape})")
 
-    # Save as RGB visualization
     rgb = normal_to_rgb(pred_normal)
     rgb_path = os.path.join(args.output, "predicted_normal.png")
     Image.fromarray(rgb).save(rgb_path)
     print(f"Saved: {rgb_path}")
 
-    # Save visualization of x, y, z components
     for i, name in enumerate(["nx", "ny", "nz"]):
         comp = pred_normal[:, :, i]
         comp_vis = ((comp + 1.0) / 2.0 * 255.0).clip(0, 255).astype(np.uint8)
-        comp_path = os.path.join(args.output, f"predicted_{name}.png")
-        Image.fromarray(comp_vis).save(comp_path)
+        Image.fromarray(comp_vis).save(os.path.join(args.output, f"predicted_{name}.png"))
 
-    print(f"\nPrediction complete. Results saved to {args.output}/")
+    print(f"\nNormal prediction complete. Results saved to {args.output}/")
+
+
+# Synapse segmentation prediction (single image -> organ mask)
+
+# Color map for Synapse organs (class -> RGB)
+SYNAPSE_COLORS = {
+    0: (0, 0, 0),        # Background
+    1: (255, 0, 0),      # Aorta
+    2: (0, 255, 0),      # Gallbladder
+    3: (0, 0, 255),      # Kidney(L)
+    4: (255, 255, 0),    # Kidney(R)
+    5: (255, 128, 0),    # Liver
+    6: (128, 0, 255),    # Pancreas
+    7: (0, 255, 255),    # Spleen
+    8: (255, 0, 255),    # Stomach
+}
+
+SYNAPSE_ORGAN_NAMES = {
+    0: "Background", 1: "Aorta", 2: "Gallbladder", 3: "Kidney(L)",
+    4: "Kidney(R)", 5: "Liver", 6: "Pancreas", 7: "Spleen", 8: "Stomach",
+}
+
+
+def label_to_color(label):
+    """Convert label map to RGB color image."""
+    H, W = label.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    for cls_id, color in SYNAPSE_COLORS.items():
+        rgb[label == cls_id] = color
+    return rgb
+
+
+@torch.no_grad()
+def predict_segmentation(model, image, device, img_size=224):
+    """
+    Predict segmentation mask for a single grayscale image.
+
+    Args:
+        model: trained TransUNetPS in segmentation mode
+        image: (H, W) float32 numpy array
+        device: torch device
+        img_size: model input size
+
+    Returns:
+        pred_label: (H, W) uint8 class labels
+    """
+    model.eval()
+    H, W = image.shape
+
+    # Resize to model input
+    img_resized = np.array(Image.fromarray(image).resize((img_size, img_size), Image.BICUBIC))
+    inp = torch.from_numpy(img_resized).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 224, 224)
+
+    out = model(inp)  # (1, num_classes, 224, 224)
+    pred = torch.argmax(out, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)  # (224, 224)
+
+    # Resize back to original
+    pred_full = np.array(Image.fromarray(pred).resize((W, H), Image.NEAREST))
+    return pred_full
+
+
+def run_synapse_prediction(args, device):
+    """Run Synapse segmentation prediction."""
+    mt = detect_model_type(args.checkpoint)
+    print(f"Auto-detected model_type: {mt}")
+
+    model_cfg = ModelConfig(model_type=mt, mode="segmentation", num_classes=9, in_channels=1)
+    model = get_model(model_cfg, model_type=mt).to(device)
+    epoch, val_loss = load_checkpoint(args.checkpoint, model)
+    print(f"Loaded checkpoint: epoch={epoch}, loss={val_loss:.4f}")
+    print(f"Parameters: {count_parameters(model):,}")
+
+    # Collect input images
+    if args.input_dir:
+        extensions = ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.npz"]
+        paths = []
+        for ext in extensions:
+            paths.extend(glob.glob(os.path.join(args.input_dir, ext)))
+        paths = sorted(paths)
+    elif args.images:
+        paths = args.images
+    else:
+        print("ERROR: Provide --input_dir or --images")
+        return
+
+    if not paths:
+        print(f"ERROR: No images found")
+        return
+
+    os.makedirs(args.output, exist_ok=True)
+    print(f"Processing {len(paths)} images...")
+
+    for p in paths:
+        name = os.path.splitext(os.path.basename(p))[0]
+        ext = os.path.splitext(p)[1].lower()
+
+        # Load image
+        if ext == ".npz":
+            data = np.load(p)
+            image = data["image"].astype(np.float32)
+        else:
+            image = np.array(Image.open(p).convert("L")).astype(np.float32) / 255.0
+
+        print(f"\n  {name}: {image.shape}")
+
+        # Predict
+        pred_label = predict_segmentation(model, image, device)
+
+        # Save label map as .npy
+        np.save(os.path.join(args.output, f"{name}_pred.npy"), pred_label)
+
+        # Save color visualization
+        color = label_to_color(pred_label)
+        Image.fromarray(color).save(os.path.join(args.output, f"{name}_pred_color.png"))
+
+        # Save grayscale label (scaled for visibility)
+        label_vis = (pred_label.astype(np.float32) / 8.0 * 255).astype(np.uint8)
+        Image.fromarray(label_vis).save(os.path.join(args.output, f"{name}_pred_label.png"))
+
+        # Print detected organs
+        unique = np.unique(pred_label)
+        organs = [SYNAPSE_ORGAN_NAMES.get(c, f"Class{c}") for c in unique if c > 0]
+        print(f"    Detected: {', '.join(organs) if organs else 'none'}")
+
+    print(f"\nSegmentation prediction complete. Results saved to {args.output}/")
+
+
+# Main
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict with TransUNetPS")
+    parser.add_argument("--mode", type=str, default="normal",
+                        choices=["normal", "synapse"],
+                        help="normal: photometric stereo, synapse: organ segmentation")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to trained model checkpoint")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Directory containing input images")
+    parser.add_argument("--images", nargs="+", default=None,
+                        help="Specific image file paths")
+    parser.add_argument("--mask", type=str, default=None,
+                        help="Optional mask image (for normal mode)")
+    parser.add_argument("--output", type=str, default="./output",
+                        help="Output directory")
+    parser.add_argument("--max_images", type=int, default=96,
+                        help="Max images to use (for normal mode)")
+    parser.add_argument("--tile_size", type=int, default=128,
+                        help="Tile size (for normal mode)")
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--model_type", type=str, default="transunet",
+                        choices=["transunet", "lightweight"],
+                        help="Model architecture (auto-detected from checkpoint)")
+    args = parser.parse_args()
+
+    config = Config(device=args.device)
+    device = config.resolve_device()
+    print(f"Device: {device}")
+
+    if args.mode == "synapse":
+        run_synapse_prediction(args, device)
+    else:
+        run_normal_prediction(args, device)
 
 
 if __name__ == "__main__":

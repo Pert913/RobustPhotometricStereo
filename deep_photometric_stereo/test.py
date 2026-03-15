@@ -24,6 +24,13 @@ Usage:
     # Test on BOTH training + testing, save output images
     python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/training --save_output ./output/training
     python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing --save_output ./output/testing
+
+    # Test on Synapse segmentation (following TransUNet test.py)
+    # Evaluate on all 12 test volumes — prints per-organ Dice scores
+    python test.py --mode synapse --checkpoint checkpoints/synapse/best.pt
+
+    # Save predictions as .npy
+    # python test.py --mode synapse --checkpoint checkpoints/synapse/best.pt --save_output ./output/synapse
 """
 import argparse
 import os
@@ -156,17 +163,126 @@ def discover_objects(data_root):
         obj_dir = os.path.join(data_root, name)
         if not os.path.isdir(obj_dir):
             continue
-        # Must have Normal_gt.npy (from prepare_data.py) and some images
         if os.path.exists(os.path.join(obj_dir, "Normal_gt.npy")):
             objects.append(name)
     return objects
 
 
+# Synapse evaluation (following TransUNet test.py)
+
+SYNAPSE_ORGAN_NAMES = {
+    1: "Aorta", 2: "Gallbladder", 3: "Kidney(L)", 4: "Kidney(R)",
+    5: "Liver", 6: "Pancreas", 7: "Spleen", 8: "Stomach",
+}
+
+
+@torch.no_grad()
+def test_synapse(checkpoint_path, synapse_root, device_str="auto", save_output=None):
+    """
+    Evaluate on Synapse test volumes (following TransUNet test.py).
+    Processes each 3D volume slice-by-slice, computes per-class Dice.
+    """
+    import h5py
+
+    config = Config(device=device_str)
+    device = config.resolve_device()
+
+    # Load model
+    mt = detect_model_type(checkpoint_path)
+    print(f"Auto-detected model_type: {mt}")
+    model_cfg = ModelConfig(model_type=mt, mode="segmentation", num_classes=9, in_channels=1)
+    model = get_model(model_cfg, model_type=mt).to(device)
+    epoch, val_loss = load_checkpoint(checkpoint_path, model)
+    model.eval()
+    print(f"Loaded checkpoint: epoch={epoch}, loss={val_loss:.4f}")
+    print(f"Parameters: {count_parameters(model):,}")
+
+    # Load test volume list
+    test_list_path = os.path.join(synapse_root, "test_vol.txt")
+    with open(test_list_path, "r") as f:
+        test_cases = [line.strip() for line in f if line.strip()]
+
+    test_h5_dir = os.path.join(synapse_root, "test_vol_h5")
+    img_size = 224
+
+    all_dice = {c: [] for c in SYNAPSE_ORGAN_NAMES}
+
+    for case_name in test_cases:
+        h5_path = os.path.join(test_h5_dir, f"{case_name}.npy.h5")
+        if not os.path.exists(h5_path):
+            print(f"  WARNING: {h5_path} not found, skipping")
+            continue
+
+        data = h5py.File(h5_path, "r")
+        image_vol = data["image"][:]   # (D, H, W) float32
+        label_vol = data["label"][:]   # (D, H, W) uint8
+        data.close()
+
+        D, H, W = image_vol.shape
+        pred_vol = np.zeros_like(label_vol, dtype=np.uint8)
+
+        # Process slice-by-slice
+        for d in range(D):
+            img_slice = image_vol[d]  # (H, W)
+
+            # Resize to model input size
+            from PIL import Image as PILImage
+            img_resized = np.array(PILImage.fromarray(img_slice).resize(
+                (img_size, img_size), PILImage.BICUBIC))
+
+            # To tensor
+            inp = torch.from_numpy(img_resized).float().unsqueeze(0).unsqueeze(0).to(device)
+            out = model(inp)  # (1, num_classes, 224, 224)
+            pred = torch.argmax(out, dim=1).squeeze(0).cpu().numpy()  # (224, 224)
+
+            # Resize prediction back to original
+            pred_resized = np.array(PILImage.fromarray(pred.astype(np.uint8)).resize(
+                (W, H), PILImage.NEAREST))
+            pred_vol[d] = pred_resized
+
+        # Compute per-class Dice for this volume
+        print(f"\n  {case_name} ({D} slices, {H}x{W}):")
+        for cls_id, cls_name in SYNAPSE_ORGAN_NAMES.items():
+            pred_mask = (pred_vol == cls_id).astype(np.float32)
+            gt_mask = (label_vol == cls_id).astype(np.float32)
+            intersect = (pred_mask * gt_mask).sum()
+            total = pred_mask.sum() + gt_mask.sum()
+            if total == 0:
+                dice = 1.0 if intersect == 0 else 0.0
+            else:
+                dice = (2.0 * intersect) / total
+            all_dice[cls_id].append(dice)
+            print(f"    {cls_name:>15s}: {dice * 100:.2f}%")
+
+        # Save prediction if requested
+        if save_output:
+            out_dir = os.path.join(save_output, case_name)
+            os.makedirs(out_dir, exist_ok=True)
+            np.save(os.path.join(out_dir, "prediction.npy"), pred_vol)
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"  Synapse Evaluation Summary — {len(test_cases)} volumes")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"{'='*60}")
+    avg_all = []
+    for cls_id, cls_name in SYNAPSE_ORGAN_NAMES.items():
+        scores = all_dice[cls_id]
+        if scores:
+            mean_dice = np.mean(scores) * 100
+            avg_all.append(mean_dice)
+            print(f"  {cls_name:>15s}: {mean_dice:.2f}%")
+    if avg_all:
+        print(f"  {'':>15s}  --------")
+        print(f"  {'Average Dice':>15s}: {np.mean(avg_all):.2f}%")
+    print(f"{'='*60}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate TransUNetPS")
     parser.add_argument("--mode", type=str, default="eval_all",
-                        choices=["eval", "eval_all", "logo_eval"],
-                        help="eval: single object, eval_all: all objects in data_root, logo_eval: LOGO folds")
+                        choices=["eval", "eval_all", "logo_eval", "synapse"],
+                        help="eval: single object, eval_all: all objects, synapse: Synapse segmentation")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
@@ -175,10 +291,21 @@ def main():
                         help="Object to evaluate on (for --mode eval)")
     parser.add_argument("--data_root", type=str, default="./data/training",
                         help="Directory containing test objects")
+    parser.add_argument("--synapse_root", type=str, default="./data/Synapse",
+                        help="Synapse dataset root (for --mode synapse)")
     parser.add_argument("--save_output", type=str, default=None,
                         help="Directory to save prediction outputs")
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
+
+    # synapse: segmentation evaluation
+    if args.mode == "synapse":
+        if not args.checkpoint:
+            print("ERROR: --checkpoint required")
+            return
+        test_synapse(args.checkpoint, os.path.abspath(args.synapse_root),
+                     device_str=args.device, save_output=args.save_output)
+        return
 
     config = Config(device=args.device)
     device = config.resolve_device()
