@@ -504,12 +504,9 @@ class TransUNetPS(nn.Module):
         return self.head(decoded)
 
 
-# ══════════════════════════════════════════════════════════════════════
 # LightweightUNetPS — Previous lightweight architecture (~4.7M params)
 # Uses nn.TransformerEncoderLayer instead of custom Attention/Block.
 # Smaller channels [32, 64, 128, 256] with simpler decoder.
-# ══════════════════════════════════════════════════════════════════════
-
 class _LWConvBlock(nn.Module):
     """Two 3x3 convolutions with BatchNorm and ReLU."""
 

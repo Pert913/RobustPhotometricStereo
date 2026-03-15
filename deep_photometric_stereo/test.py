@@ -183,7 +183,7 @@ def main():
     config = Config(device=args.device)
     device = config.resolve_device()
 
-    # ── eval: single object ──────────────────────────────────────────
+    # eval: single object ======
     if args.mode == "eval":
         if not args.checkpoint:
             print("ERROR: --checkpoint required")
@@ -210,7 +210,7 @@ def main():
 
         evaluate_object(model, test_ds, 0, device, save_dir=args.save_output)
 
-    # ── eval_all: one checkpoint, all objects in data_root ───────────
+    # eval_all: one checkpoint, all objects in data_root ==
     elif args.mode == "eval_all":
         if not args.checkpoint:
             print("ERROR: --checkpoint required")
@@ -266,7 +266,7 @@ def main():
             print(f"  {'Worst':>20s}: {all_results[worst_obj]:.2f} ({worst_obj})")
             print(f"{'='*60}")
 
-    # ── logo_eval: one checkpoint per fold ───────────────────────────
+    # logo_eval: one checkpoint per fold
     elif args.mode == "logo_eval":
         data_root = os.path.abspath(args.data_root)
         objects = config.data.objects

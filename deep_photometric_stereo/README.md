@@ -163,22 +163,60 @@ NormalHead: Conv(16->3) -> L2 normalize -> [B, 3, H, W]
 
 ---
 
-## Prediction
+## Testing / Evaluation
+
+Model type is **auto-detected** from the checkpoint — no need to pass `--model_type`.
 
 ```bash
-# Predict with TransUNet model (default)
-python predict.py \
-    --checkpoint checkpoints/train/best.pt \
-    --input_dir /path/to/images/ \
-    --mask /path/to/mask.png \
-    --output ./output/
+# Prepare test data first (if not already done)
+python prepare_data.py --data_root ./data/testing
 
-# Predict with lightweight model
-python predict.py \
-    --checkpoint checkpoints/train/best.pt \
-    --model_type lightweight \
-    --input_dir /path/to/images/ \
-    --output ./output/
+# Test on ALL objects in a folder (recommended)
+python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/training
+python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing
+
+# Test on ALL objects and save output images
+python test.py --mode eval_all --checkpoint checkpoints/train/best.pt --data_root ./data/testing --save_output ./output/testing
+
+# Test on a single object
+python test.py --mode eval --checkpoint checkpoints/train/best.pt --test_object ballPNG
+
+# Test LOGO folds (if trained with --mode logo_cv)
+python test.py --mode logo_eval --checkpoint_dir checkpoints/
+```
+
+`eval_all` prints a summary table:
+```
+============================================================
+  Evaluation Summary — 10 objects
+  Checkpoint: checkpoints/train/best.pt
+============================================================
+              ballPNG: 12.34
+              bearPNG: 15.67
+                  ...
+            --------
+              Average: 14.52
+               Median: 13.80
+                 Best: 12.34 (ballPNG)
+                Worst: 18.90 (harvestPNG)
+============================================================
+```
+
+---
+
+## Prediction
+
+Model type is **auto-detected** from the checkpoint.
+
+```bash
+# Predict normal map from a folder of images
+python predict.py --checkpoint checkpoints/train/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
+
+# Predict with a mask
+python predict.py --checkpoint checkpoints/train/best.pt --input_dir /path/to/images/ --mask /path/to/mask.png --output ./output/
+
+# Predict from specific image files
+python predict.py --checkpoint checkpoints/train/best.pt --images img1.png img2.png img3.png --output ./output/
 
 # Output files:
 #   output/predicted_normal.npy   (H, W, 3) float32
