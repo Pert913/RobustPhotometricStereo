@@ -51,13 +51,16 @@ from utils import (
 @torch.no_grad()
 def predict_full_resolution(model, images, device, tile_size=128, max_images=96):
     """
-    Predict normal map for full-resolution images using tiling.
+    Predict normal map using simple non-overlapping tiling.
+
+    Tiles must match training patch size (128x128) to avoid position
+    embedding interpolation issues.
 
     Args:
         model: TransUNetPS or LightweightUNetPS model
         images: (N, 1, H, W) tensor
         device: torch device
-        tile_size: tile size for processing
+        tile_size: must match training patch size (default 128)
         max_images: max images to use
 
     Returns:
@@ -65,43 +68,38 @@ def predict_full_resolution(model, images, device, tile_size=128, max_images=96)
     """
     model.eval()
     N, C, H, W = images.shape
+    tile_size = max(16, (tile_size // 16) * 16)
 
-    # Pad H and W to be divisible by 16 (for encoder downsampling)
-    pad_h = (16 - H % 16) % 16
-    pad_w = (16 - W % 16) % 16
+    # Subsample N
+    if N > max_images:
+        indices = torch.linspace(0, N - 1, max_images).long()
+        images = images[indices]
+        n_used = max_images
+    else:
+        n_used = N
+
+    # Pad to divisible by tile_size
+    pad_h = (tile_size - H % tile_size) % tile_size
+    pad_w = (tile_size - W % tile_size) % tile_size
     if pad_h > 0 or pad_w > 0:
         images = torch.nn.functional.pad(images, (0, pad_w, 0, pad_h), mode="reflect")
 
     _, _, pH, pW = images.shape
     pred_normal = torch.zeros(3, pH, pW)
-
-    # Use tile_size that's divisible by 16
-    tile_size = max(16, (tile_size // 16) * 16)
+    counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
     for y in range(0, pH, tile_size):
         for x in range(0, pW, tile_size):
-            y_end = min(y + tile_size, pH)
-            x_end = min(x + tile_size, pW)
+            tile_imgs = images[:, :, y:y + tile_size, x:x + tile_size]
+            tile_imgs = tile_imgs.unsqueeze(0).to(device)
 
-            tile_imgs = images[:, :, y:y_end, x:x_end]
+            pred_tile = model(tile_imgs, counts)[0].cpu()
+            pred_normal[:, y:y + tile_size, x:x + tile_size] = pred_tile
 
-            # Subsample N if too many
-            if N > max_images:
-                indices = torch.linspace(0, N - 1, max_images).long()
-                tile_imgs = tile_imgs[indices]
-                n_used = max_images
-            else:
-                n_used = N
-
-            tile_imgs = tile_imgs.unsqueeze(0).to(device)  # (1, N, 1, th, tw)
-            counts = torch.tensor([n_used], dtype=torch.long, device=device)
-
-            pred_tile = model(tile_imgs, counts)  # (1, 3, th, tw)
-            pred_normal[:, y:y_end, x:x_end] = pred_tile[0].cpu()
-
-    # Remove padding
+    # Crop to original size and normalize
     pred_normal = pred_normal[:, :H, :W]
-    return pred_normal
+    norm = pred_normal.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    return pred_normal / norm
 
 
 def evaluate_object(model, test_ds, obj_idx, device, save_dir=None):

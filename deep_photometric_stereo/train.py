@@ -86,8 +86,9 @@ def poly_lr(optimizer, base_lr, iter_num, max_iters, power=0.9):
 
 def train_one_epoch(model, loader, criterion, optimizer, device,
                     grad_clip=1.0, log_interval=50,
-                    base_lr=0.01, iter_offset=0, max_iters=10000, lr_power=0.9):
-    """Train for one epoch with per-iteration polynomial LR. Returns (avg_loss, iter_count)."""
+                    base_lr=0.01, iter_offset=0, max_iters=10000, lr_power=0.9,
+                    use_poly_lr=True):
+    """Train for one epoch. Returns (avg_loss, iter_count)."""
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -109,9 +110,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 
         optimizer.step()
 
-        # Polynomial LR decay per iteration (following TransUNet)
+        # Poly LR per iteration (only for SGD mode)
         iter_num += 1
-        poly_lr(optimizer, base_lr, iter_num, max_iters, lr_power)
+        if use_poly_lr:
+            poly_lr(optimizer, base_lr, iter_num, max_iters, lr_power)
 
         total_loss += loss.item()
         n_batches += 1
@@ -215,14 +217,26 @@ def train_fold(
     model = get_model(config.model, model_type=config.model.model_type).to(device)
     print(f"Model parameters: {count_parameters(model):,}")
 
-    # Optimizer — SGD with momentum (following TransUNet trainer.py)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=config.train.lr,
-        momentum=config.train.momentum,
-        weight_decay=config.train.weight_decay,
-    )
-    # Polynomial LR decay (following TransUNet trainer.py)
+    # Optimizer
+    use_adamw = config.train.optimizer == "adamw"
+    if use_adamw:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.train.lr,
+            weight_decay=config.train.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.train.epochs, eta_min=1e-6,
+        )
+        print(f"Optimizer: AdamW, lr={config.train.lr}, cosine annealing")
+    else:
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config.train.lr,
+            momentum=config.train.momentum,
+            weight_decay=config.train.weight_decay,
+        )
+        print(f"Optimizer: SGD, lr={config.train.lr}, poly decay")
     max_iters = config.train.epochs * len(train_loader)
     lr_power = config.train.lr_power
     base_lr = config.train.lr
@@ -251,7 +265,12 @@ def train_fold(
             log_interval=config.train.log_interval,
             base_lr=base_lr, iter_offset=iter_num,
             max_iters=max_iters, lr_power=lr_power,
+            use_poly_lr=not use_adamw,
         )
+
+        # Step cosine scheduler per epoch (AdamW mode)
+        if use_adamw:
+            scheduler.step()
 
         elapsed = time.time() - t0
         lr = optimizer.param_groups[0]["lr"]
@@ -488,6 +507,9 @@ def main():
     parser.add_argument("--model_type", type=str, default="transunet",
                         choices=["transunet", "lightweight"],
                         help="Model architecture: transunet (~11M) or lightweight (~4.7M)")
+    parser.add_argument("--optimizer", type=str, default="adamw",
+                        choices=["adamw", "sgd"],
+                        help="Optimizer: adamw (recommended for from-scratch) or sgd (TransUNet paper)")
     args = parser.parse_args()
 
     if args.mode == "synapse":
@@ -508,6 +530,7 @@ def main():
                 epochs=args.epochs,
                 lr=args.lr,
                 save_dir=args.save_dir,
+                optimizer=args.optimizer,
             ),
             device=args.device,
         )

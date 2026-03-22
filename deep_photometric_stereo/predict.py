@@ -89,48 +89,63 @@ def normalize_images(images, mask=None):
 
 @torch.no_grad()
 def predict_normal(model, images, device, tile_size=128, max_images=96):
-    """Predict normal map from multiple images using tiling."""
+    """
+    Predict normal map using simple non-overlapping tiling.
+
+    Tiles the full image into tile_size x tile_size patches (matching
+    the training patch size), processes each independently, and
+    stitches the results back together.
+    """
     model.eval()
     N, H, W = images.shape
+    tile_size = max(16, (tile_size // 16) * 16)
 
-    pad_h = (16 - H % 16) % 16
-    pad_w = (16 - W % 16) % 16
+    # Subsample N if too many
+    if N > max_images:
+        indices = np.linspace(0, N - 1, max_images).astype(int)
+        images = images[indices]
+    n_used = images.shape[0]
+
+    # Pad to be divisible by tile_size
+    pad_h = (tile_size - H % tile_size) % tile_size
+    pad_w = (tile_size - W % tile_size) % tile_size
     if pad_h > 0 or pad_w > 0:
         images = np.pad(images, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
 
     _, pH, pW = images.shape
     pred_normal = np.zeros((3, pH, pW), dtype=np.float32)
-    tile_size = max(16, (tile_size // 16) * 16)
+    counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
-    if N > max_images:
-        indices = np.linspace(0, N - 1, max_images).astype(int)
-        images_sub = images[indices]
-    else:
-        images_sub = images
+    n_tiles_y = pH // tile_size
+    n_tiles_w = pW // tile_size
+    total_tiles = n_tiles_y * n_tiles_w
 
-    n_used = images_sub.shape[0]
-    print(f"Predicting with {n_used} images, tile_size={tile_size}, resolution={pH}x{pW}...")
+    print(f"Predicting with {n_used} images, tile={tile_size}, "
+          f"resolution={H}x{W}, tiles={total_tiles}")
 
-    total_tiles = ((pH + tile_size - 1) // tile_size) * ((pW + tile_size - 1) // tile_size)
     tile_idx = 0
+    for ty in range(n_tiles_y):
+        for tx in range(n_tiles_w):
+            y = ty * tile_size
+            x = tx * tile_size
 
-    for y in range(0, pH, tile_size):
-        for x in range(0, pW, tile_size):
-            y_end = min(y + tile_size, pH)
-            x_end = min(x + tile_size, pW)
-
-            tile = images_sub[:, y:y_end, x:x_end]
+            tile = images[:, y:y + tile_size, x:x + tile_size]
             tile_tensor = torch.from_numpy(tile).float().unsqueeze(1).unsqueeze(0).to(device)
-            counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
             pred_tile = model(tile_tensor, counts)
-            pred_normal[:, y:y_end, x:x_end] = pred_tile[0].cpu().numpy()
+            pred_normal[:, y:y + tile_size, x:x + tile_size] = pred_tile[0].cpu().numpy()
 
             tile_idx += 1
             if tile_idx % 10 == 0 or tile_idx == total_tiles:
                 print(f"  Tile {tile_idx}/{total_tiles}")
 
+    # Crop to original size
     pred_normal = pred_normal[:, :H, :W]
+
+    # L2 normalize
+    norm = np.sqrt((pred_normal ** 2).sum(axis=0, keepdims=True))
+    pred_normal = pred_normal / np.maximum(norm, 1e-8)
+
     return pred_normal.transpose(1, 2, 0)  # (H, W, 3)
 
 

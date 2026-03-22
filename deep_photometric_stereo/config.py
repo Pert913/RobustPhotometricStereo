@@ -74,15 +74,15 @@ class TrainConfig:
     """
     Training configuration.
 
-    TransUNet uses: SGD(lr=0.01, momentum=0.9, wd=1e-4), poly LR decay,
-                    0.5*CE + 0.5*Dice, 150 epochs
-    We use same optimizer settings for alignment.
+    For photometric stereo (training from scratch): AdamW, lr=1e-3, cosine annealing
+    For Synapse (TransUNet alignment): SGD, lr=0.01, poly decay
     """
-    epochs: int = 150  # TransUNet: 150
-    lr: float = 0.01  # TransUNet: 0.01
-    weight_decay: float = 1e-4  # TransUNet: 1e-4
-    momentum: float = 0.9  # TransUNet: 0.9
-    lr_power: float = 0.9  # TransUNet polynomial decay power
+    epochs: int = 150
+    lr: float = 1e-3  # AdamW default for training from scratch
+    weight_decay: float = 1e-4
+    momentum: float = 0.9  # for SGD (Synapse mode)
+    lr_power: float = 0.9  # for poly decay (Synapse mode)
+    optimizer: str = "adamw"  # "adamw" for photometric stereo, "sgd" for synapse
 
     # Loss weights (for photometric stereo mode)
     angular_weight: float = 0.5
@@ -90,7 +90,7 @@ class TrainConfig:
     l1_weight: float = 0.2
 
     # Early stopping
-    patience: int = 30
+    patience: int = 50  # more patient (was 30, stopped too early)
 
     # Gradient clipping
     grad_clip: float = 1.0
