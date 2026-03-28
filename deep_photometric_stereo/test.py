@@ -51,10 +51,10 @@ from utils import (
 @torch.no_grad()
 def predict_full_resolution(model, images, device, tile_size=128, max_images=96):
     """
-    Predict normal map using simple non-overlapping tiling.
+    Predict normal map using Sliding Window with Hanning Blending.
 
-    Tiles must match training patch size (128x128) to avoid position
-    embedding interpolation issues.
+    Same approach as predict.py: generous padding + 50% overlap + Hanning window.
+    All tiles are tile_size x tile_size (matching training patch size).
 
     Args:
         model: TransUNetPS or LightweightUNetPS model
@@ -66,9 +66,13 @@ def predict_full_resolution(model, images, device, tile_size=128, max_images=96)
     Returns:
         pred_normal: (3, H, W) tensor on CPU
     """
+    import numpy as _np
+
     model.eval()
     N, C, H, W = images.shape
     tile_size = max(16, (tile_size // 16) * 16)
+    overlap = 0.5
+    stride = int(tile_size * (1 - overlap))
 
     # Subsample N
     if N > max_images:
@@ -78,26 +82,45 @@ def predict_full_resolution(model, images, device, tile_size=128, max_images=96)
     else:
         n_used = N
 
-    # Pad to divisible by tile_size
-    pad_h = (tile_size - H % tile_size) % tile_size
-    pad_w = (tile_size - W % tile_size) % tile_size
-    if pad_h > 0 or pad_w > 0:
-        images = torch.nn.functional.pad(images, (0, pad_w, 0, pad_h), mode="reflect")
+    # Generous padding: tile_size//2 on all sides
+    pad_top = tile_size // 2
+    pad_bottom = (tile_size - H % stride) % stride + tile_size // 2
+    pad_left = tile_size // 2
+    pad_right = (tile_size - W % stride) % stride + tile_size // 2
+    images = torch.nn.functional.pad(images, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
 
     _, _, pH, pW = images.shape
-    pred_normal = torch.zeros(3, pH, pW)
+
+    # Hanning window
+    window_1d = _np.hanning(tile_size).astype(_np.float32)
+    window_2d = _np.outer(window_1d, window_1d)
+    window_t = torch.from_numpy(window_2d)  # (tile_size, tile_size)
+
+    pred_accum = torch.zeros(3, pH, pW)
+    weight_accum = torch.zeros(1, pH, pW)
     counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
-    for y in range(0, pH, tile_size):
-        for x in range(0, pW, tile_size):
+    y_positions = list(range(0, pH - tile_size + 1, stride))
+    x_positions = list(range(0, pW - tile_size + 1, stride))
+
+    for y in y_positions:
+        for x in x_positions:
             tile_imgs = images[:, :, y:y + tile_size, x:x + tile_size]
             tile_imgs = tile_imgs.unsqueeze(0).to(device)
 
-            pred_tile = model(tile_imgs, counts)[0].cpu()
-            pred_normal[:, y:y + tile_size, x:x + tile_size] = pred_tile
+            pred_tile = model(tile_imgs, counts)[0].cpu()  # (3, tile_size, tile_size)
 
-    # Crop to original size and normalize
-    pred_normal = pred_normal[:, :H, :W]
+            pred_accum[:, y:y + tile_size, x:x + tile_size] += pred_tile * window_t.unsqueeze(0)
+            weight_accum[:, y:y + tile_size, x:x + tile_size] += window_t.unsqueeze(0)
+
+    # Weighted average
+    weight_accum = weight_accum.clamp(min=1e-5)
+    pred_normal = pred_accum / weight_accum
+
+    # Crop padding
+    pred_normal = pred_normal[:, pad_top:pad_top + H, pad_left:pad_left + W]
+
+    # Re-normalize
     norm = pred_normal.norm(dim=0, keepdim=True).clamp(min=1e-8)
     return pred_normal / norm
 

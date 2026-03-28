@@ -88,17 +88,12 @@ def normalize_images(images, mask=None):
 
 
 @torch.no_grad()
-def predict_normal(model, images, device, tile_size=128, max_images=96):
+def predict_normal(model, images, device, tile_size=128, overlap=0.5, max_images=96):
     """
-    Predict normal map using simple non-overlapping tiling.
-
-    Tiles the full image into tile_size x tile_size patches (matching
-    the training patch size), processes each independently, and
-    stitches the results back together.
+    Predict normal map using Sliding Window with Hanning Blending.
     """
     model.eval()
     N, H, W = images.shape
-    tile_size = max(16, (tile_size // 16) * 16)
 
     # Subsample N if too many
     if N > max_images:
@@ -106,47 +101,68 @@ def predict_normal(model, images, device, tile_size=128, max_images=96):
         images = images[indices]
     n_used = images.shape[0]
 
-    # Pad to be divisible by tile_size
-    pad_h = (tile_size - H % tile_size) % tile_size
-    pad_w = (tile_size - W % tile_size) % tile_size
-    if pad_h > 0 or pad_w > 0:
-        images = np.pad(images, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
+    tile_size = max(16, (tile_size // 16) * 16)
+    stride = int(tile_size * (1 - overlap))
 
-    _, pH, pW = images.shape
-    pred_normal = np.zeros((3, pH, pW), dtype=np.float32)
+    print(f"Predicting with {n_used} images, tile_size={tile_size}, stride={stride}...")
+
+    # Generous padding: tile_size//2 on all sides so real image edges
+    # always fall into the center of tiles (where Hanning weight is high)
+    pad_top = tile_size // 2
+    pad_bottom = (tile_size - H % stride) % stride + tile_size // 2
+    pad_left = tile_size // 2
+    pad_right = (tile_size - W % stride) % stride + tile_size // 2
+
+    images_pad = np.pad(images, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
+    _, pH, pW = images_pad.shape
+
+    # Accumulation buffers
+    pred_normal_accum = np.zeros((3, pH, pW), dtype=np.float32)
+    weight_accum = np.zeros((1, pH, pW), dtype=np.float32)
+
+    # Hanning window: smoothly tapers from 1.0 at center to 0.0 at edges
+    window_1d = np.hanning(tile_size).astype(np.float32)
+    window_2d = np.outer(window_1d, window_1d)
+    window_3d = window_2d[np.newaxis, :, :]
+
     counts = torch.tensor([n_used], dtype=torch.long, device=device)
 
-    n_tiles_y = pH // tile_size
-    n_tiles_w = pW // tile_size
-    total_tiles = n_tiles_y * n_tiles_w
-
-    print(f"Predicting with {n_used} images, tile={tile_size}, "
-          f"resolution={H}x{W}, tiles={total_tiles}")
-
+    y_positions = list(range(0, pH - tile_size + 1, stride))
+    x_positions = list(range(0, pW - tile_size + 1, stride))
+    total_tiles = len(y_positions) * len(x_positions)
     tile_idx = 0
-    for ty in range(n_tiles_y):
-        for tx in range(n_tiles_w):
-            y = ty * tile_size
-            x = tx * tile_size
 
-            tile = images[:, y:y + tile_size, x:x + tile_size]
+    # Sliding window loop
+    for y in y_positions:
+        for x in x_positions:
+            tile = images_pad[:, y:y + tile_size, x:x + tile_size]
             tile_tensor = torch.from_numpy(tile).float().unsqueeze(1).unsqueeze(0).to(device)
 
             pred_tile = model(tile_tensor, counts)
-            pred_normal[:, y:y + tile_size, x:x + tile_size] = pred_tile[0].cpu().numpy()
+            pred_np = pred_tile[0].cpu().numpy()  # (3, tile_size, tile_size)
+
+            # Weighted accumulation with Hanning window
+            pred_normal_accum[:, y:y + tile_size, x:x + tile_size] += pred_np * window_3d
+            weight_accum[:, y:y + tile_size, x:x + tile_size] += window_3d
 
             tile_idx += 1
             if tile_idx % 10 == 0 or tile_idx == total_tiles:
                 print(f"  Tile {tile_idx}/{total_tiles}")
 
-    # Crop to original size
-    pred_normal = pred_normal[:, :H, :W]
+    print("Blending tiles...")
 
-    # L2 normalize
-    norm = np.sqrt((pred_normal ** 2).sum(axis=0, keepdims=True))
-    pred_normal = pred_normal / np.maximum(norm, 1e-8)
+    # Weighted average (blending)
+    weight_accum = np.clip(weight_accum, 1e-5, None)
+    pred_normal_blended = pred_normal_accum / weight_accum
 
-    return pred_normal.transpose(1, 2, 0)  # (H, W, 3)
+    # Crop padding to get back to original image size
+    pred_normal_final = pred_normal_blended[:, pad_top:pad_top + H, pad_left:pad_left + W]
+
+    # Re-normalize to unit vectors
+    norms = np.linalg.norm(pred_normal_final, axis=0, keepdims=True)
+    pred_normal_final = pred_normal_final / (norms + 1e-8)
+
+    return pred_normal_final.transpose(1, 2, 0)
 
 
 def run_normal_prediction(args, device):
