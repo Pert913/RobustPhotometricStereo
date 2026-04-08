@@ -4,6 +4,7 @@ Utility functions for UNetPS.
 import os
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 
 def angular_error_map(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -95,3 +96,40 @@ def detect_model_type(path):
 def count_parameters(model) -> int:
     """Count trainable parameters."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def plot_training_curve(train_losses, val_epochs=None, val_maes=None, save_path="training_curve.png"):
+    """
+    Vẽ biểu đồ 2 trục (Twin Axes): 
+    - Trục trái (Xanh): Training Loss
+    - Trục phải (Đỏ): Validation MAE (Đường chữ U)
+    """
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    # 1. Vẽ Training Loss (Trục trái)
+    epochs = range(1, len(train_losses) + 1)
+    ax1.plot(epochs, train_losses, linestyle='-', color='#1f77b4', linewidth=2, label='Training Loss')
+    ax1.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Training Loss', fontsize=12, color='#1f77b4', fontweight='bold')
+    ax1.tick_params(axis='y', labelcolor='#1f77b4')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    # 2. Vẽ Validation MAE (Trục phải) - Nếu có dữ liệu
+    if val_epochs and val_maes and len(val_epochs) > 0:
+        ax2 = ax1.twinx()  # Tạo trục Y thứ 2 dùng chung trục X
+        ax2.plot(val_epochs, val_maes, linestyle='--', marker='o', color='#d62728', linewidth=2, label='Validation MAE')
+        ax2.set_ylabel('Validation MAE (Degrees)', fontsize=12, color='#d62728', fontweight='bold')
+        ax2.tick_params(axis='y', labelcolor='#d62728')
+        
+        # Gộp chú thích (Legend) của cả 2 đường vào 1 hộp
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=2)
+    else:
+        ax1.legend(loc='upper right')
+
+    plt.title('Model Convergence: Training Loss vs Validation MAE', fontsize=15, fontweight='bold', pad=25)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"📉 Đã lưu biểu đồ Đánh giá Training tại: {save_path}")

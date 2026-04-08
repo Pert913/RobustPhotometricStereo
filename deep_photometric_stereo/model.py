@@ -5,36 +5,15 @@ Closely follows the TransUNet implementation from:
     Chen et al., "TransUNet: Rethinking the U-Net architecture design for medical
     image segmentation through the lens of transformers", Medical Image Analysis, 2024.
     Source: https://github.com/Beckschen/TransUNet
-
-Architecture (Encoder-only configuration):
-    Part I:   CNN Encoder (shared across N images for photometric stereo)
-    Fusion:   Multi-scale max-pooling across N images (our contribution)
-    Part III: Transformer Encoder (Attention + MLP blocks, following TransUNet exactly)
-    Part II:  CNN Decoder (Cascaded upsampler with skip connections)
-    Head:     Normal prediction (L2-normalized) or segmentation
-
-Key alignment with TransUNet source code:
-    - Attention class: query/key/value projections, scaled dot-product (vit_seg_modeling.py:50-94)
-    - Mlp class: fc1 ---> GELU ---> dropout ---> fc2 ---> dropout (vit_seg_modeling.py:97-119)
-    - Block class: pre-LayerNorm, MSA + residual, MLP + residual (vit_seg_modeling.py:168-224)
-    - Encoder: stack of Blocks + final LayerNorm (vit_seg_modeling.py:227-244)
-    - DecoderCup: Conv2dReLU head ---> DecoderBlocks with skip connections (vit_seg_modeling.py:326-367)
-    - DecoderBlock: Upsample ---> Cat(skip) ---> Conv2dReLU × 2 (vit_seg_modeling.py:284-315)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import copy
-
 
 # Transformer Components (following TransUNet vit_seg_modeling.py)
 
 class Attention(nn.Module):
-    """
-    Multi-head self-attention (TransUNet vit_seg_modeling.py:50-94).
-    """
-
     def __init__(self, hidden_size, num_heads, attention_dropout_rate=0.0):
         super().__init__()
         self.num_heads = num_heads
@@ -49,7 +28,6 @@ class Attention(nn.Module):
         self.proj_dropout = nn.Dropout(attention_dropout_rate)
 
     def _transpose_for_scores(self, x):
-        # (B, seq_len, all_head_size) -> (B, num_heads, seq_len, head_size)
         new_shape = x.size()[:-1] + (self.num_heads, self.head_size)
         x = x.view(*new_shape)
         return x.permute(0, 2, 1, 3)
@@ -73,11 +51,6 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
-    """
-    MLP block (TransUNet vit_seg_modeling.py:97-119).
-    fc1 ---> GELU ---> dropout ---> fc2 ---> dropout
-    """
-
     def __init__(self, hidden_size, mlp_dim, dropout_rate=0.1):
         super().__init__()
         self.fc1 = nn.Linear(hidden_size, mlp_dim)
@@ -102,14 +75,7 @@ class Mlp(nn.Module):
 
 
 class Block(nn.Module):
-    """
-    Transformer block with pre-LayerNorm (TransUNet vit_seg_modeling.py:168-224).
-        z' = MSA(LN(z)) + z
-        z  = MLP(LN(z')) + z'
-    """
-
-    def __init__(self, hidden_size, num_heads, mlp_dim,
-                 dropout_rate=0.1, attention_dropout_rate=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_dim, dropout_rate=0.1, attention_dropout_rate=0.0):
         super().__init__()
         self.attention_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.ffn_norm = nn.LayerNorm(hidden_size, eps=1e-6)
@@ -120,22 +86,17 @@ class Block(nn.Module):
         h = x
         x = self.attention_norm(x)
         x = self.attn(x)
-        x = x + h  # residual
+        x = x + h
 
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
-        x = x + h  # residual
+        x = x + h
         return x
 
 
 class TransformerEncoder(nn.Module):
-    """
-    Stack of Transformer blocks + final LayerNorm (TransUNet vit_seg_modeling.py:227-244).
-    """
-
-    def __init__(self, hidden_size, num_heads, mlp_dim, num_layers,
-                 dropout_rate=0.1, attention_dropout_rate=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_dim, num_layers, dropout_rate=0.1, attention_dropout_rate=0.0):
         super().__init__()
         self.layers = nn.ModuleList([
             Block(hidden_size, num_heads, mlp_dim, dropout_rate, attention_dropout_rate)
@@ -150,32 +111,19 @@ class TransformerEncoder(nn.Module):
 
 
 class Embeddings(nn.Module):
-    """
-    Patch embedding + positional encoding (TransUNet vit_seg_modeling.py:122-165).
-    Tokenizes CNN feature maps into a sequence with learned position embeddings.
-    """
-
     def __init__(self, in_channels, hidden_size, img_size=8, patch_size=1, dropout_rate=0.1):
         super().__init__()
-        # Patch embedding via conv projection
-        self.patch_embeddings = nn.Conv2d(
-            in_channels, hidden_size,
-            kernel_size=patch_size, stride=patch_size
-        )
+        self.patch_embeddings = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
         n_patches = (img_size // patch_size) ** 2
-        self.position_embeddings = nn.Parameter(
-            torch.zeros(1, n_patches, hidden_size)
-        )
+        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches, hidden_size))
         self.dropout = nn.Dropout(dropout_rate)
         self.patch_size = patch_size
 
     def forward(self, x):
-        """x: (B, C, H, W) -> (B, n_patches, hidden_size)"""
-        x = self.patch_embeddings(x)  # (B, hidden_size, H', W')
+        x = self.patch_embeddings(x)
         self._h, self._w = x.shape[2], x.shape[3]
-        x = x.flatten(2).transpose(-1, -2)  # (B, n_patches, hidden_size)
+        x = x.flatten(2).transpose(-1, -2)
 
-        # Add position embeddings (interpolate if spatial size changed)
         seq_len = x.shape[1]
         if seq_len != self.position_embeddings.shape[1]:
             pos_embed = self._interpolate_pos_embed(self._h, self._w)
@@ -187,26 +135,22 @@ class Embeddings(nn.Module):
         return x
 
     def _interpolate_pos_embed(self, target_h, target_w):
-        """Interpolate position embeddings for different spatial sizes."""
-        pos = self.position_embeddings  # (1, orig_len, hidden)
+        pos = self.position_embeddings
         hidden = pos.shape[2]
         orig_len = pos.shape[1]
         orig_h = orig_w = int(math.sqrt(orig_len))
 
         pos = pos.reshape(1, orig_h, orig_w, hidden).permute(0, 3, 1, 2)
-        pos = F.interpolate(pos, size=(target_h, target_w),
-                            mode='bilinear', align_corners=False)
+        pos = F.interpolate(pos, size=(target_h, target_w), mode='bilinear', align_corners=False)
         pos = pos.permute(0, 2, 3, 1).reshape(1, target_h * target_w, hidden)
         return pos
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CNN Encoder (Part I) — shared across N images for photometric stereo
+# CNN Encoder (Part I)
 # ══════════════════════════════════════════════════════════════════════
 
 class Conv2dReLU(nn.Sequential):
-    """Conv2d + BatchNorm + ReLU (TransUNet vit_seg_modeling.py:259-281)."""
-
     def __init__(self, in_ch, out_ch, kernel_size=3, padding=1, stride=1):
         super().__init__(
             nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=False),
@@ -216,8 +160,6 @@ class Conv2dReLU(nn.Sequential):
 
 
 class EncoderBlock(nn.Module):
-    """Two Conv2dReLU layers (U-Net style encoder block)."""
-
     def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
         self.conv1 = Conv2dReLU(in_ch, out_ch)
@@ -231,11 +173,6 @@ class EncoderBlock(nn.Module):
 
 
 class SharedEncoder(nn.Module):
-    """
-    Shared-weight CNN encoder (Part I), applied per image.
-    Returns multi-scale features for skip connections.
-    """
-
     def __init__(self, in_channels=1, channels=(64, 128, 256, 512), dropout=0.1):
         super().__init__()
         self.enc1 = EncoderBlock(in_channels, channels[0], dropout)
@@ -248,30 +185,16 @@ class SharedEncoder(nn.Module):
         self.pool4 = nn.MaxPool2d(2)
 
     def forward(self, x):
-        e1 = self.enc1(x)          # (B*N, ch[0], H, W)
-        e2 = self.enc2(self.pool1(e1))  # (B*N, ch[1], H/2, W/2)
-        e3 = self.enc3(self.pool2(e2))  # (B*N, ch[2], H/4, W/4)
-        e4 = self.enc4(self.pool3(e3))  # (B*N, ch[3], H/8, W/8)
-        bottleneck = self.pool4(e4)     # (B*N, ch[3], H/16, W/16)
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        bottleneck = self.pool4(e4)
         return [e1, e2, e3, e4], bottleneck
 
 
-# Multi-Scale Fusion (our contribution for photometric stereo)
-
 class MultiScaleFusion(nn.Module):
-    """Max-pool across N images at each encoder scale + bottleneck."""
-
     def forward(self, skip_features_list, bottleneck, B, N, image_counts=None):
-        """
-        Args:
-            skip_features_list: list of (B*N, C, H, W) at each encoder scale
-            bottleneck: (B*N, C, H/16, W/16)
-            B, N: batch size, max images
-            image_counts: (B,) actual counts
-        Returns:
-            fused_skips: list of (B, C, H, W) at each scale
-            fused_bottleneck: (B, C, H/16, W/16)
-        """
         all_features = skip_features_list + [bottleneck]
         fused = []
         for feat in all_features:
@@ -286,17 +209,12 @@ class MultiScaleFusion(nn.Module):
             pooled, _ = feat.max(dim=1)
             fused.append(pooled)
 
-        return fused[:-1], fused[-1]  # skips, bottleneck
+        return fused[:-1], fused[-1]
 
 
-# CNN Decoder (Part II) — following TransUNet DecoderCup
+# CNN Decoder (Part II)
 
 class DecoderBlock(nn.Module):
-    """
-    Decoder block (TransUNet vit_seg_modeling.py:284-315).
-    Upsample ---> Cat(skip) ---> Conv2dReLU × 2
-    """
-
     def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
         self.up = nn.UpsamplingBilinear2d(scale_factor=2)
@@ -313,21 +231,11 @@ class DecoderBlock(nn.Module):
 
 
 class DecoderCup(nn.Module):
-    """
-    Cascaded upsampler decoder (TransUNet vit_seg_modeling.py:326-367).
-
-    Transforms Transformer output back to spatial features and
-    progressively upsamples with skip connections from CNN encoder.
-    """
-
     def __init__(self, hidden_size, encoder_channels, decoder_channels, n_skip=4):
         super().__init__()
-        # First layer: project from hidden_size to first decoder channel
-        # (TransUNet: conv_more, line 345)
         head_ch = decoder_channels[0]
         self.conv_more = Conv2dReLU(hidden_size, head_ch)
 
-        # Decoder blocks with skip connections
         self.blocks = nn.ModuleList()
         in_ch = head_ch
         for i, out_ch in enumerate(decoder_channels[1:]):
@@ -338,20 +246,11 @@ class DecoderCup(nn.Module):
         self.n_skip = n_skip
 
     def forward(self, hidden_states, skips, h, w):
-        """
-        Args:
-            hidden_states: (B, seq_len, hidden_size) from Transformer
-            skips: list of (B, C, H, W) from encoder [e1, e2, e3, e4]
-            h, w: spatial dims of bottleneck
-        """
         B = hidden_states.shape[0]
-        # Reshape tokens to spatial: (B, seq_len, hidden) ---> (B, hidden, h, w)
         x = hidden_states.permute(0, 2, 1).contiguous().view(B, -1, h, w)
         x = self.conv_more(x)
 
-        # Reverse skips for decoder (highest resolution last ---> first)
         skips = list(reversed(skips)) if skips else []
-
         for i, block in enumerate(self.blocks):
             skip = skips[i] if i < len(skips) and i < self.n_skip else None
             x = block(x, skip)
@@ -362,8 +261,6 @@ class DecoderCup(nn.Module):
 # Output Heads
 
 class NormalHead(nn.Module):
-    """Normal map prediction: Conv ---> L2 normalize."""
-
     def __init__(self, in_ch, out_ch=3):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
@@ -374,8 +271,6 @@ class NormalHead(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """Segmentation head (TransUNet vit_seg_modeling.py:318-323)."""
-
     def __init__(self, in_ch, num_classes, upscale_factor=1):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, num_classes, kernel_size=3, padding=1)
@@ -388,17 +283,6 @@ class SegmentationHead(nn.Module):
 # TransUNetPS — Main Model
 
 class TransUNetPS(nn.Module):
-    """
-    TransUNet for Photometric Stereo (and segmentation).
-
-    Closely follows the TransUNet Encoder-only architecture with our
-    additions for multi-image photometric stereo.
-
-    Supports two modes:
-        - 'normal': Predicts L2-normalized surface normal maps (photometric stereo)
-        - 'segmentation': Predicts class logits (medical image segmentation)
-    """
-
     def __init__(self, config=None):
         super().__init__()
         if config is None:
@@ -410,26 +294,22 @@ class TransUNetPS(nn.Module):
         hidden_size = config.hidden_size
         self.mode = getattr(config, 'mode', 'normal')
 
-        # Part I: CNN Encoder
+        # [QUAN TRỌNG]: Ép cứng in_channels = 1 cho ảnh xám
         self.encoder = SharedEncoder(
-            in_channels=config.in_channels,
+            in_channels=getattr(config, 'in_channels', 1), 
             channels=enc_ch,
             dropout=config.dropout,
         )
 
-        # Multi-scale fusion (for photometric stereo with N images)
         self.fusion = MultiScaleFusion()
-
-        # Patch embedding: CNN bottleneck ---> Transformer tokens
         self.embeddings = Embeddings(
-            in_channels=enc_ch[-1],  # bottleneck channels
+            in_channels=enc_ch[-1],
             hidden_size=hidden_size,
-            img_size=8,  # H/16 for 128 patch, adaptable
+            img_size=8,
             patch_size=1,
             dropout_rate=config.transformer_dropout,
         )
 
-        # Part III: Transformer Encoder
         self.transformer_encoder = TransformerEncoder(
             hidden_size=hidden_size,
             num_heads=config.transformer_heads,
@@ -439,7 +319,6 @@ class TransUNetPS(nn.Module):
             attention_dropout_rate=config.attention_dropout_rate,
         )
 
-        # Part II: CNN Decoder
         self.decoder = DecoderCup(
             hidden_size=hidden_size,
             encoder_channels=enc_ch,
@@ -447,7 +326,6 @@ class TransUNetPS(nn.Module):
             n_skip=config.n_skip,
         )
 
-        # Output head
         if self.mode == 'segmentation':
             self.head = SegmentationHead(dec_ch[-1], config.num_classes)
         else:
@@ -470,46 +348,28 @@ class TransUNetPS(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, images, image_counts=None):
-        """
-        Args:
-            images: (B, N, C, H, W) for photometric stereo (N images)
-                    or (B, C, H, W) for segmentation (single image)
-            image_counts: (B,) for variable N (photometric stereo only)
-
-        Returns:
-            (B, 3, H, W) unit normals or (B, num_classes, H, W) logits
-        """
         if images.dim() == 5:
-            # Photometric stereo mode: (B, N, C, H, W)
+            # images shape: (B, N, 1, H, W)
             B, N, C, H, W = images.shape
             x = images.view(B * N, C, H, W)
             skips, bottleneck = self.encoder(x)
             fused_skips, fused_bn = self.fusion(skips, bottleneck, B, N, image_counts)
         else:
-            # Single image mode: (B, C, H, W) — for segmentation
             B, C, H, W = images.shape
             skips, bottleneck = self.encoder(images)
             fused_skips = skips
             fused_bn = bottleneck
 
-        # Patch embedding + Transformer encoder
         tokens = self.embeddings(fused_bn)
         h, w = self.embeddings._h, self.embeddings._w
         encoded = self.transformer_encoder(tokens)
-
-        # Decoder with skip connections
         decoded = self.decoder(encoded, fused_skips, h, w)
-
-        # Output
         return self.head(decoded)
 
 
-# LightweightUNetPS — Previous lightweight architecture (~4.7M params)
-# Uses nn.TransformerEncoderLayer instead of custom Attention/Block.
-# Smaller channels [32, 64, 128, 256] with simpler decoder.
-class _LWConvBlock(nn.Module):
-    """Two 3x3 convolutions with BatchNorm and ReLU."""
+# LightweightUNetPS 
 
+class _LWConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
         self.block = nn.Sequential(
@@ -527,8 +387,6 @@ class _LWConvBlock(nn.Module):
 
 
 class _LWDownBlock(nn.Module):
-    """MaxPool -> ConvBlock."""
-
     def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
@@ -539,8 +397,6 @@ class _LWDownBlock(nn.Module):
 
 
 class _LWUpBlock(nn.Module):
-    """Upsample -> Concat skip -> ConvBlock."""
-
     def __init__(self, in_ch, skip_ch, out_ch, dropout=0.0):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
@@ -555,22 +411,9 @@ class _LWUpBlock(nn.Module):
 
 
 class LightweightUNetPS(nn.Module):
-    """
-    Lightweight U-Net + Transformer for Uncalibrated Photometric Stereo.
-
-    This is the previous (~4.7M param) architecture using:
-      - Smaller encoder channels: [32, 64, 128, 256]
-      - nn.TransformerEncoderLayer (PyTorch built-in) instead of custom blocks
-      - Learned 2D positional encoding (row + column embeddings)
-      - Simple U-Net decoder with skip connections
-      - ~4.7M parameters
-
-    Use this for faster training / lower memory requirements.
-    """
-
-    # Default config for lightweight model
+    # [QUAN TRỌNG]: in_channels = 1 
     DEFAULTS = dict(
-        in_channels=1,
+        in_channels=1, 
         encoder_channels=[32, 64, 128, 256],
         bottleneck_channels=256,
         decoder_channels=[128, 64, 32, 32],
@@ -584,10 +427,8 @@ class LightweightUNetPS(nn.Module):
 
     def __init__(self, config=None):
         super().__init__()
-        # Always use lightweight defaults — ignore TransUNet-sized config channels
         d = self.DEFAULTS.copy()
         if config is not None:
-            # Only take non-architecture settings from config
             for k in ['in_channels', 'out_channels', 'dropout',
                        'transformer_heads', 'transformer_ff_dim',
                        'transformer_layers', 'transformer_dropout']:
@@ -598,17 +439,14 @@ class LightweightUNetPS(nn.Module):
         dec_ch = d['decoder_channels']
         bn_ch = d['bottleneck_channels']
 
-        # Encoder
         self.enc1 = _LWConvBlock(d['in_channels'], enc_ch[0], d['dropout'])
         self.enc2 = _LWDownBlock(enc_ch[0], enc_ch[1], d['dropout'])
         self.enc3 = _LWDownBlock(enc_ch[1], enc_ch[2], d['dropout'])
         self.enc4 = _LWDownBlock(enc_ch[2], enc_ch[3], d['dropout'])
         self.bottleneck = _LWDownBlock(enc_ch[3], bn_ch, d['dropout'])
 
-        # Fusion
         self.fusion = MultiScaleFusion()
 
-        # Transformer bottleneck (PyTorch built-in)
         self.patch_proj = nn.Conv2d(bn_ch, bn_ch, 1)
         self.pos_embed_row = nn.Embedding(64, bn_ch // 2)
         self.pos_embed_col = nn.Embedding(64, bn_ch // 2)
@@ -624,13 +462,11 @@ class LightweightUNetPS(nn.Module):
         self.transformer_norm = nn.LayerNorm(bn_ch)
         self.proj_back = nn.Conv2d(bn_ch, bn_ch, 1)
 
-        # Decoder
         self.up4 = _LWUpBlock(bn_ch, enc_ch[3], dec_ch[0], d['dropout'])
         self.up3 = _LWUpBlock(dec_ch[0], enc_ch[2], dec_ch[1], d['dropout'])
         self.up2 = _LWUpBlock(dec_ch[1], enc_ch[1], dec_ch[2], d['dropout'])
         self.up1 = _LWUpBlock(dec_ch[2], enc_ch[0], dec_ch[3], d['dropout'])
 
-        # Head
         self.head = nn.Conv2d(dec_ch[3], d['out_channels'], 1)
 
         self._init_weights()
@@ -687,7 +523,6 @@ class LightweightUNetPS(nn.Module):
             fused_skips = skips
             fused_bn = bn
 
-        # Transformer bottleneck
         x = self.patch_proj(fused_bn)
         residual = x
         x = self._add_pos_encoding(x)
@@ -698,34 +533,22 @@ class LightweightUNetPS(nn.Module):
         x = x.permute(0, 2, 1).view(Bt, Ct, Ht, Wt)
         x = self.proj_back(x) + residual
 
-        # Decoder
         x = self.up4(x, fused_skips[3])
         x = self.up3(x, fused_skips[2])
         x = self.up2(x, fused_skips[1])
         x = self.up1(x, fused_skips[0])
 
-        # Normal output
         x = self.head(x)
         return F.normalize(x, dim=1, eps=1e-8)
 
 
 #======
-# Factory function — selects model by type
+# Factory function
 #======
 
-# Backward compatibility alias
 UNetPS = TransUNetPS
 
-
 def get_model(config=None, model_type="transunet"):
-    """
-    Factory function to create the model.
-
-    Args:
-        config: ModelConfig instance
-        model_type: "transunet" (default, ~11M params, aligned with TransUNet paper)
-                    or "lightweight" (~4.7M params, simpler architecture)
-    """
     if model_type == "lightweight":
         return LightweightUNetPS(config)
     else:

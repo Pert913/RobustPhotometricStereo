@@ -1,0 +1,107 @@
+Auto-detected model_type: transunet
+Loaded checkpoint from epoch 20 (val_loss=15.5767)
+Parameters: 10,962,995
+Data root: C:\Programming\Photometric Stereo\RobustPhotometricStereo\deep_photometric_stereo\data\training
+Objects found: 10 — ['ballPNG', 'bearPNG', 'buddhaPNG', 'catPNG', 'cowPNG', 'gobletPNG', 'harvestPNG', 'pot1PNG', 'pot2PNG', 'readingPNG']
+
+Evaluating: ballPNG (96 images, 512x612)
+  Mean Angular Error: 15.58
+  Median Error:       15.26
+  Max Error:          74.73
+  <10 pixels:         25.1%
+  <20 pixels:         72.5%
+  <30 pixels:         96.4%
+
+Evaluating: bearPNG (96 images, 512x612)
+  Mean Angular Error: 21.45
+  Median Error:       19.81
+  Max Error:          120.74
+  <10 pixels:         17.9%
+  <20 pixels:         50.7%
+  <30 pixels:         79.6%
+
+Evaluating: buddhaPNG (96 images, 512x612)
+  Mean Angular Error: 29.75
+  Median Error:       25.80
+  Max Error:          140.03
+  <10 pixels:         11.4%
+  <20 pixels:         36.3%
+  <30 pixels:         58.6%
+
+Evaluating: catPNG (96 images, 512x612)
+  Mean Angular Error: 23.73
+  Median Error:       20.41
+  Max Error:          112.65
+  <10 pixels:         13.8%
+  <20 pixels:         48.6%
+  <30 pixels:         75.0%
+
+Evaluating: cowPNG (96 images, 512x612)
+  Mean Angular Error: 19.32
+  Median Error:       16.11
+  Max Error:          114.87
+  <10 pixels:         28.0%
+  <20 pixels:         62.0%
+  <30 pixels:         82.6%
+
+Evaluating: gobletPNG (96 images, 512x612)
+  Mean Angular Error: 23.94
+  Median Error:       19.42
+  Max Error:          143.48
+  <10 pixels:         20.5%
+  <20 pixels:         51.6%
+  <30 pixels:         71.7%
+
+Evaluating: harvestPNG (96 images, 512x612)
+  Mean Angular Error: 31.68
+  Median Error:       27.71
+  Max Error:          130.59
+  <10 pixels:         10.6%
+  <20 pixels:         32.2%
+  <30 pixels:         55.2%
+
+Evaluating: pot1PNG (96 images, 512x612)
+  Mean Angular Error: 27.49
+  Median Error:       23.74
+  Max Error:          144.34
+  <10 pixels:         9.0%
+  <20 pixels:         37.1%
+  <30 pixels:         66.9%
+
+Evaluating: pot2PNG (96 images, 512x612)
+  Mean Angular Error: 23.34
+  Median Error:       20.35
+  Max Error:          132.12
+  <10 pixels:         17.7%
+  <20 pixels:         48.9%
+  <30 pixels:         75.3%
+
+Evaluating: readingPNG (96 images, 512x612)
+  Mean Angular Error: 34.50
+  Median Error:       29.99
+  Max Error:          122.89
+  <10 pixels:         8.1%
+  <20 pixels:         29.6%
+  <30 pixels:         50.0%
+
+============================================================
+  Evaluation Summary — 10 objects
+  Checkpoint: checkpoints/train/best.pt
+  Data root:  C:\Programming\Photometric Stereo\RobustPhotometricStereo\deep_photometric_stereo\data\training  
+============================================================
+               ballPNG: 15.58
+               bearPNG: 21.45
+             buddhaPNG: 29.75
+                catPNG: 23.73
+                cowPNG: 19.32
+             gobletPNG: 23.94
+            harvestPNG: 31.68
+               pot1PNG: 27.49
+               pot2PNG: 23.34
+            readingPNG: 34.50
+                        --------
+               Average: 25.08
+                Median: 23.84
+                  Best: 15.58 (ballPNG)
+                 Worst: 34.50 (readingPNG)
+============================================================
