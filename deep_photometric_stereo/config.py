@@ -29,6 +29,26 @@ class DataConfig:
     batch_size: int = 4
     num_workers: int = 0  # 0 for macOS compatibility
 
+    # 24-LED ring mixing strategy. When True, each training sample simulates the
+    # physical 24-LED ring (8 per R/G/B arc) by mixing 8 point-light renders per
+    # channel with random weights b_{c,i} ~ U(0,1), plus an env light with alpha
+    # ~ U(0.4, 0.7). The model sees I_sub = I_train - alpha*I_env. When False,
+    # falls back to the legacy "3 random lights stacked as RGB" path.
+    use_ring_mixing: bool = True
+    ring_tilt_deg: float = 30.0  # canonical LED tilt from optical axis
+    alpha_min: float = 0.4
+    alpha_max: float = 0.7
+    # Std of Gaussian noise added to I_lights_off before subtraction, simulating
+    # dark-frame capture noise (read noise + residual shot noise). Applied in raw
+    # intensity units i.e. before per-channel z-score, so the effective noise on
+    # the normalized signal is roughly dark_noise_std / signal_std. 0.0 disables.
+    dark_noise_std: float = 0.01
+    # Per-sample random gamma in [gamma_min, gamma_max] applied to the raw ring-
+    # mixed image before z-score. Augments for tonemap / sensor-response variation.
+    # Set both to 1.0 to disable.
+    gamma_min: float = 0.7
+    gamma_max: float = 1.4
+
 
 @dataclass
 class ModelConfig:
@@ -39,7 +59,7 @@ class ModelConfig:
     TransUNet original: hidden=768, heads=12, layers=12, mlp=3072 (~86M params)
     Ours: hidden=256, heads=4, layers=2, mlp=512 (~5M params, lightweight)
     """
-    in_channels: int = 1  # grayscale input
+    in_channels: int = 3  # grayscale input
     encoder_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
     decoder_channels: List[int] = field(default_factory=lambda: [512, 256, 128, 64, 16])
     out_channels: int = 3  # normal map (x, y, z)

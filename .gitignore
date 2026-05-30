@@ -12,3 +12,6 @@ data/caesar_specular/.DS_Store
 deep_photometric_stereo/data/
 deep_photometric_stereo/checkpoints/
 deep_photometric_stereo/output/
+deep_photometric_stereo/.claude/
+deep_photometric_stereo/train_split.json
+deep_photometric_stereo/val_split.json

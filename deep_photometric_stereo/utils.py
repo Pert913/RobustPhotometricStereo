@@ -66,13 +66,91 @@ def save_checkpoint(model, optimizer, epoch, val_loss, path, model_type=None):
 
 
 def load_checkpoint(path, model, optimizer=None):
-    """Load model checkpoint. Returns epoch and val_loss."""
+    """
+    Loads model weights and handles backward compatibility for old checkpoints.
+    Performs on-the-fly tensor surgery for channel and shape mismatches.
+    """
+    import torch
+    import torch.nn as nn
+    print(f"=> Loading checkpoint '{path}'")
+    
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    return ckpt.get("epoch", 0), ckpt.get("val_loss", float("inf"))
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
 
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k
+        # 1. Rename keys for Up-sampling blocks (Decoder)
+        if k.startswith("up") and "conv.block." in k:
+            new_k = k.replace("conv.block.", "conv.")
+            
+        # 2. Rename keys for Head block
+        elif k == "head.weight":
+            new_k = "head.conv.weight"
+        elif k == "head.bias":
+            new_k = "head.conv.bias"
+            
+        new_state_dict[new_k] = v
+
+    # =================================================================
+    # TENSOR SURGERY (Upgrade old Head to new Head)
+    # =================================================================
+    if "head.conv.weight" in new_state_dict:
+        hw = new_state_dict["head.conv.weight"]
+        # If old matrix shape is [3, 32, 1, 1], upgrade to [4, 32, 3, 3]
+        if hw.shape == torch.Size([3, 32, 1, 1]):
+            print("[ADAPTER] Upgrading head.conv.weight from 1x1 (3 ch) to 3x3 (4 ch)")
+            # Create a new matrix initialized with zeros
+            new_hw = torch.zeros(4, 32, 3, 3, dtype=hw.dtype, device=hw.device)
+            # Place the old 1x1 matrix at the center of the new 3x3 matrix
+            new_hw[:3, :, 1:2, 1:2] = hw
+            new_state_dict["head.conv.weight"] = new_hw
+            
+    if "head.conv.bias" in new_state_dict:
+        hb = new_state_dict["head.conv.bias"]
+        # If old bias shape is [3], upgrade to [4]
+        if hb.shape == torch.Size([3]):
+            print("[ADAPTER] Upgrading head.conv.bias from 3 to 4")
+            new_hb = torch.zeros(4, dtype=hb.dtype, device=hb.device)
+            new_hb[:3] = hb
+            # Set Mask channel bias = 5.0 (Sigmoid(5) ~ 0.99 -> Assume whole image is foreground)
+            new_hb[3] = 5.0
+            new_state_dict["head.conv.bias"] = new_hb
+
+    # --- NEW SURGERY FOR DECOUPLED HEAD COMPATIBILITY ---
+    legacy_head = False
+    if "head.conv.weight" in new_state_dict:
+        print("[ADAPTER] Detected legacy coupled MultiTaskHead. Patching model architecture on-the-fly...")
+        legacy_head = True
+        
+        hw = new_state_dict["head.conv.weight"]
+        out_ch, in_ch, kH, kW = hw.shape
+        
+        # Dynamically add the old conv layer to the new model (Will be moved to device on first pass)
+        model.head.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kH, padding=kH//2)
+        
+        # Override the forward method of the head to bypass normal_head and mask_head
+        def legacy_forward(x):
+            # CẬP NHẬT: Tự động di chuyển lớp Conv cũ sang đúng Device (MPS/CUDA) của ảnh đầu vào
+            if next(model.head.conv.parameters()).device != x.device:
+                model.head.conv = model.head.conv.to(x.device)
+            return model.head.conv(x)
+        
+        model.head.forward = legacy_forward
+    # =================================================================
+
+    # Load the updated state_dict into the model
+    # strict=False avoids crashing on missing "normal_head" / "mask_head" keys for old checkpoints
+    model.load_state_dict(new_state_dict, strict=not legacy_head)
+    
+    epoch = ckpt.get("epoch", 0)
+    val_loss = ckpt.get("val_loss", 0.0)
+    
+    if optimizer and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        print(f"=> Loaded optimizer state")
+        
+    return epoch, val_loss
 
 def detect_model_type(path):
     """Detect model_type from a checkpoint file. Returns 'transunet' or 'lightweight'."""
