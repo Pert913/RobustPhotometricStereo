@@ -26,6 +26,7 @@ from PIL import Image, ImageOps
 from config import Config, ModelConfig
 from model import get_model
 from utils import normal_to_rgb, load_checkpoint, detect_model_type, count_parameters
+from dataset import _canonical_led_directions, _match_canonical
 
 
 # ==============================================================================
@@ -167,7 +168,27 @@ def _otsu_threshold(lum_map):
             best_t = b
     return float(best_t)
 
-def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_images=96, dark_frame=None):
+def _ring_aggregate_images(images, light_dirs, tilt_deg=30.0):
+    """
+    Match each of 24 canonical LED ring slots to the closest available light, then
+    sum the 8 lights of each colour arc into one channel. Returns (3, H, W) float32.
+    This mirrors the training-time `_ring_mix_channels` with b_i = 1 (uniform).
+    The post-tile z-score normalises the resulting per-channel scale.
+    """
+    canonical = _canonical_led_directions(tilt_deg)
+    ring_idx = _match_canonical(light_dirs, canonical)
+    channels = []
+    for c in range(3):
+        acc = np.zeros_like(images[0], dtype=np.float32)
+        for i in range(8):
+            acc += images[int(ring_idx[c * 8 + i])].astype(np.float32)
+        channels.append(acc)
+    return np.stack(channels, axis=0)
+
+
+def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_images=96,
+                   dark_frame=None, light_dirs=None, ring_tilt_deg=30.0,
+                   use_model_mask=False):
     """
     Predict normal map using Sliding Window with high overlap for zero-tiling.
     Includes Auto-Masking from the Segmentation branch.
@@ -188,7 +209,11 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
         img_rgb = images[0]
         if img_rgb.max() > 2.0: img_rgb = img_rgb.astype(np.float32) / 255.0
         images = np.stack([img_rgb[:, :, 0], img_rgb[:, :, 1], img_rgb[:, :, 2]], axis=0)
-    elif images.ndim == 3 and images.shape[2] >= 3 and images.shape[0] != 3:
+    elif (images.ndim == 3 and images.shape[2] in (3, 4)
+            and images.shape[2] < images.shape[0] and images.shape[0] != 3):
+        # (H, W, 3|4) single multi-channel image -> split RGB into 3 PS channels.
+        # Guard with shape[2] < shape[0] so an (N, H, W) grayscale stack with N != 3
+        # and W >= 3 (the common DiLiGenT sequence case) does NOT match here.
         if images.max() > 2.0: images = images.astype(np.float32) / 255.0
         images = np.stack([images[:, :, 0], images[:, :, 1], images[:, :, 2]], axis=0)
     elif images.ndim == 4 and images.shape[3] >= 3:
@@ -207,7 +232,15 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     # Keep the full lit set around for the dark-reference mask before subsetting to 3.
     lit_full = images
 
-    if images.shape[0] > 3:
+    if (light_dirs is not None and images.shape[0] == len(light_dirs)
+            and images.shape[0] >= 3):
+        # Ring-aggregation path: match each of 24 canonical LED slots to the
+        # closest available light, sum 8 lights per arc into one channel. This
+        # matches the training-time ring-mix distribution.
+        print(f"[*] Ring-aggregating {images.shape[0]} lights -> 3 channels "
+              f"(tilt={ring_tilt_deg}°)")
+        images = _ring_aggregate_images(images, light_dirs, tilt_deg=ring_tilt_deg)
+    elif images.shape[0] > 3:
         n = images.shape[0]
         if n >= 9:
             # Select one image from each third of the sequence so the 3 chosen lights
@@ -280,25 +313,31 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     # ==============================================================
     from scipy.ndimage import binary_closing, binary_fill_holes, gaussian_filter, label, center_of_mass
 
-    if dark_frame is not None:
+    if use_model_mask and pred_final.shape[0] >= 4:
+        # Use the model's seg-head logit directly. Sigmoid -> threshold at 0.5.
+        mask_prob = 1.0 / (1.0 + np.exp(-pred_final[3]))
+        bright_mask = mask_prob > 0.5
+        bg_floor = float(mask_prob.min())
+        brightness_threshold = 0.5
+        mask_source = "model"
+    elif dark_frame is not None:
         # Per-pixel max LED-driven response across the full sequence.
         # Clipping at 0 throws away pixels where ambient actually decreased
         # (e.g. small AE drift between dark and lit shots).
         diff = np.maximum(0.0, lit_full - dark_frame[np.newaxis, ...])  # (N, H, W)
         signal = diff.max(axis=0)                                       # (H, W)
+        bg_floor = float(np.percentile(signal, 5))
+        brightness_threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+        bright_mask = signal > brightness_threshold
         mask_source = "dark-ref"
     else:
         # Luminance weights blue at only 11%, so dark-blue fabric backgrounds stay dim
         # while the LED-lit object (with strong R and G components) remains bright.
         signal = 0.2989 * images[0] + 0.5870 * images[1] + 0.1140 * images[2]
+        bg_floor = float(np.percentile(signal, 5))
+        brightness_threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+        bright_mask = signal > brightness_threshold
         mask_source = "Otsu"
-
-    # Otsu picks the bimodal split between dim background and lit foreground.
-    # Floor at max(5th-percentile * 1.5) prevents over-segmentation in uniform images.
-    bg_floor = float(np.percentile(signal, 5))
-    brightness_threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
-
-    bright_mask = signal > brightness_threshold
 
     # Scale the closing kernel to image size so gaps get bridged regardless of resolution
     close_px = max(15, int(min(H, W) * 0.007))   # ~0.7% of shorter side
@@ -349,6 +388,22 @@ def run_normal_prediction(args, device):
 
     images = load_images(input_dir=args.input_dir, image_paths=args.images, max_images=args.max_images)
 
+    light_dirs = None
+    if args.ring_aggregate and args.input_dir:
+        ld_path = os.path.join(args.input_dir, "light_directions.txt")
+        if os.path.exists(ld_path):
+            try:
+                ld = np.loadtxt(ld_path, dtype=np.float32)
+                if ld.ndim == 2 and ld.shape[1] == 3 and ld.shape[0] == images.shape[0]:
+                    norms = np.linalg.norm(ld, axis=1, keepdims=True)
+                    light_dirs = (ld / (norms + 1e-8)).astype(np.float32)
+                    print(f"Loaded light directions: {light_dirs.shape} from {ld_path}")
+                else:
+                    print(f"[!] light_directions.txt shape {ld.shape} doesn't match "
+                          f"{images.shape[0]} images, falling back to 3-of-N selection")
+            except Exception as ex:
+                print(f"[!] Failed to load {ld_path}: {ex}")
+
     mask = None
     if args.mask and os.path.exists(args.mask):
         mask = np.array(Image.open(args.mask).convert("L")).astype(np.float32)
@@ -370,7 +425,12 @@ def run_normal_prediction(args, device):
     png_input_path = os.path.join(args.output, "input.png")
     Image.fromarray(png_tensor, mode='RGB').save(png_input_path)
 
-    pred_normal = predict_normal(model, images, device, tile_size=args.tile_size, overlap=args.overlap)
+    pred_normal = predict_normal(
+        model, images, device,
+        tile_size=args.tile_size, overlap=args.overlap,
+        light_dirs=light_dirs, ring_tilt_deg=args.ring_tilt_deg,
+        use_model_mask=args.use_model_mask,
+    )
 
     if mask is not None:
         pred_normal = pred_normal * mask[..., None]
@@ -513,6 +573,15 @@ def main():
     parser.add_argument("--model_type", type=str, default="auto",
                         choices=["auto", "transunet", "lightweight", "swin"],
                         help="Model architecture (auto-detected from checkpoint by default)")
+    parser.add_argument("--ring_aggregate", dest="ring_aggregate", action="store_true", default=True,
+                        help="Aggregate N lights into 3 ring-mixed channels using light_directions.txt (default: on)")
+    parser.add_argument("--no_ring_aggregate", dest="ring_aggregate", action="store_false",
+                        help="Disable ring aggregation; use legacy 3-of-N selection (for old checkpoints)")
+    parser.add_argument("--ring_tilt_deg", type=float, default=30.0,
+                        help="Canonical LED tilt from optical axis (must match training)")
+    parser.add_argument("--use_model_mask", action="store_true",
+                        help="Use the model's seg-head prediction as the foreground mask "
+                             "(instead of Otsu / dark-ref)")
     args = parser.parse_args()
 
     config = Config(device=args.device)
