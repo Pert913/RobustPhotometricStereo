@@ -6,11 +6,27 @@ Supports two modes:
   - synapse: Single image segmentation -> organ mask
 
 Usage:
-    # Photometric stereo: predict normal map from a single RGB multiplexed image
-    python predict.py --checkpoint checkpoints/best_trans.pt --images data/testing/batteryPNG/001.png --output ./output/
+    # ============================================================================
+    # REAL PHONE PHOTO (iPhone/Android JPEG) — RECOMMENDED COMMAND
+    # Auto-applies: sRGB->linear conversion, Otsu foreground normalization,
+    # downscale-to-training-scale (then upscales the result back).
+    # --no_pred_mask: model mask heads over-segment on real photos; Otsu is accurate.
+    # ============================================================================
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/target/APC_0014.jpg --output ./output/my_test --no_pred_mask
 
-    # Photometric stereo: predict normal map from folder of grayscale images
-    python predict.py --checkpoint checkpoints/best.pt --input_dir ./data/testing/batteryPNG --output ./output/
+    # Checkpoints to compare:
+    #   checkpoints/run/best_trans.pt     (transunet,   Val MAE 7.9 — LEGACY mask head, ALWAYS use --no_pred_mask)
+    #   checkpoints/run/best_trans_25.pt  (transunet,   Val MAE 9.3)
+    #   checkpoints/run/best_lw_25.pt     (lightweight, Val MAE 9.9)
+
+    # DiLiGenT test sequence (folder of grayscale PNGs):
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt \
+        --input_dir data/testing/bootao2PNG --output ./output/bootao2 --no_pred_mask
+
+    # Useful flags:
+    #   --linearize auto|on|off   sRGB->linear ('auto' = on for .jpg/.jpeg only)
+    #   --resize_max 1024         downscale longest side before predict (0 = off)
+    #   --no_pred_mask            use Otsu mask instead of the model's mask head
 
     # Synapse: segment a single CT slice
     python predict.py --mode synapse --checkpoint checkpoints/synapse/best.pt --images image.png --output ./output/
@@ -32,7 +48,15 @@ from utils import normal_to_rgb, load_checkpoint, detect_model_type, count_param
 # PHOTOMETRIC STEREO PREDICTION
 # ==============================================================================
 
-def load_images(input_dir=None, image_paths=None, max_images=96):
+def _srgb_to_linear(x):
+    """
+    Inverse sRGB EOTF — converts gamma-encoded camera photos to linear radiance.
+    """
+    x = np.clip(x, 0.0, 1.0).astype(np.float32)
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4).astype(np.float32)
+
+
+def load_images(input_dir=None, image_paths=None, max_images=96, linearize="auto"):
     """
     Load images for prediction.
     Supports two modes:
@@ -68,6 +92,11 @@ def load_images(input_dir=None, image_paths=None, max_images=96):
             if img_pil.mode in ("RGB", "RGBA"):
                 print("[*] Detected single RGB image! Enabling RGB Multiplexing Mode (R,G,B -> 3 light angles)")
                 img_rgb = np.array(img_pil.convert("RGB")).astype(np.float32) / 255.0
+                # sRGB -> linear: phone JPEGs are gamma-encoded; training data is linear.
+                do_linearize = (linearize == "on") or (linearize == "auto" and ext in (".jpg", ".jpeg"))
+                if do_linearize:
+                    img_rgb = _srgb_to_linear(img_rgb)
+                    print("[*] Applied sRGB -> linear conversion (camera photo detected)")
                 # Split RGB into 3 separate grayscale channels (N, H, W) -> (3, H, W)
                 images = np.stack([img_rgb[:, :, 0], img_rgb[:, :, 1], img_rgb[:, :, 2]], axis=0)
                 print(f"  Extracted 3 channels from single image. Shape: {images.shape}, dtype: {images.dtype}")
@@ -103,6 +132,9 @@ def load_images(input_dir=None, image_paths=None, max_images=96):
                     img = img[:, :, 0]
         else:
             img = np.array(Image.open(p).convert("L")).astype(np.float32) / 255.0
+            do_linearize = (linearize == "on") or (linearize == "auto" and ext in (".jpg", ".jpeg"))
+            if do_linearize:
+                img = _srgb_to_linear(img)
         images.append(img)
 
     images = np.stack(images, axis=0)
@@ -123,14 +155,23 @@ def normalize_images(images, mask=None):
     return images
 
 
-def _normalize_tile_zscore(tile):
-    """Z-score each channel using non-dark pixels — exactly matches DiLiGentDataset per-patch normalization."""
+def _normalize_tile_zscore(tile, fg=None):
     tile = tile.copy()
-    fg = tile.max(axis=0) > 0.04  # background is unlit/dark in LED ring PS setup
+    if fg is None:
+        fg = tile.max(axis=0) > 0.04  # legacy: background is unlit/dark in LED ring PS setup
     for c in range(tile.shape[0]):
         n = int(fg.sum())
-        m = float(tile[c][fg].mean()) if n > 20 else float(tile[c].mean())
-        s = (float(tile[c][fg].std()) + 1e-8) if n > 20 else (float(tile[c].std()) + 1e-8)
+        if n > 20:
+            vals = tile[c][fg]
+            # p99 clip on foreground (matches SyntheticDataset training path)
+            p99 = float(np.percentile(vals, 99.0))
+            tile[c] = np.clip(tile[c], 0.0, p99)
+            vals = tile[c][fg]
+            m = float(vals.mean())
+            s = float(vals.std()) + 1e-8
+        else:
+            m = float(tile[c].mean())
+            s = float(tile[c].std()) + 1e-8
         tile[c] = (tile[c] - m) / s
     return tile
 
@@ -173,16 +214,8 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     Predict normal map using Sliding Window with high overlap for zero-tiling.
     Includes Auto-Masking from the Segmentation branch.
 
-    Masking priority (most reliable first):
-      1. Model's predicted mask head (channel 4) — used by default for new
-         multi-task checkpoints. Cleaned with largest-connected-component
-         selection and hole filling.
-      2. Dark-frame reference (`dark_frame` provided) — robust for low-contrast
-         or transparent objects.
-      3. Otsu brightness heuristic — fallback only.
-
-    Pass `no_pred_mask=True` to ignore the model mask and use paths 2/3 only
-    (legacy behavior for `best_trans.pt` and other unreliable seg heads).
+    Pass `no_pred_mask=True` to skip Stage B and use the pure brightness mask
+    (required for `best_trans.pt` whose legacy coupled seg head is unreliable).
     """
     model.eval()
 
@@ -195,7 +228,11 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
         img_rgb = images[0]
         if img_rgb.max() > 2.0: img_rgb = img_rgb.astype(np.float32) / 255.0
         images = np.stack([img_rgb[:, :, 0], img_rgb[:, :, 1], img_rgb[:, :, 2]], axis=0)
-    elif images.ndim == 3 and images.shape[2] >= 3 and images.shape[0] != 3:
+    elif (images.ndim == 3 and images.shape[2] in (3, 4)
+          and images.shape[2] < images.shape[0] and images.shape[0] != 3):
+        # True (H, W, C) single image. The tightened guard (C in (3,4) AND C < H)
+        # prevents (N, H, W) grayscale sequences from being misclassified as a
+        # single RGB image — e.g. a (96, 768, 1024) stack must stay a sequence.
         if images.max() > 2.0: images = images.astype(np.float32) / 255.0
         images = np.stack([images[:, :, 0], images[:, :, 1], images[:, :, 2]], axis=0)
     elif images.ndim == 4 and images.shape[3] >= 3:
@@ -228,11 +265,32 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
         raise ValueError("ERROR: At least 3 images are required!")
 
     _, H, W = images.shape
-    
+
     tile_size = min(max(64, (tile_size // 16) * 16), 1024)
     stride = max(1, int(tile_size * (1 - overlap)))
 
     print(f"[*] Predicting High-Res ({H}x{W}) | Tile: {tile_size} | Overlap: {overlap*100}%...")
+
+    # ==============================================================
+    # GLOBAL FOREGROUND ESTIMATE FOR NORMALIZATION
+    # Training z-scores each patch on GROUND-TRUTH MASK pixels only. At
+    # inference we approximate that mask with Otsu on luminance intersected
+    # with the legacy brightness rule. On DiLiGenT (black background) this
+    # matches the old behavior; on real photos it excludes the gamma-lifted
+    # background that was corrupting the z-score statistics.
+    # ==============================================================
+    lum_full = 0.2989 * images[0] + 0.5870 * images[1] + 0.1140 * images[2]
+    otsu_t = _otsu_threshold(lum_full)
+    fg_global = (lum_full > otsu_t) & (images.max(axis=0) > 0.04)
+    fg_frac = float(fg_global.mean())
+    if fg_frac < 0.005 or fg_frac > 0.90:
+        # Otsu collapsed (uniform image or inverted) — fall back to legacy rule
+        fg_global = images.max(axis=0) > 0.04
+        print(f"[!] Otsu foreground unreliable ({fg_frac:.1%}) — using legacy >0.04 rule "
+              f"({fg_global.mean():.1%} fg)")
+    else:
+        print(f"[*] Foreground estimate for normalization: {fg_frac:.1%} of image "
+              f"(otsu_t={otsu_t:.3f})")
 
     pad_top = tile_size // 2
     pad_bottom = (tile_size - H % stride) % stride + tile_size // 2
@@ -240,6 +298,7 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     pad_right = (tile_size - W % stride) % stride + tile_size // 2
 
     images_pad = np.pad(images, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
+    fg_pad = np.pad(fg_global, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
     _, pH, pW = images_pad.shape
 
     # FIX: Initialize 4-channel accumulation array (instead of 3) to capture the Mask channel
@@ -256,7 +315,8 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     for y in y_positions:
         for x in x_positions:
             tile = images_pad[:, y:y + tile_size, x:x + tile_size].copy()
-            tile = _normalize_tile_zscore(tile)  # match DiLiGentDataset per-patch normalization
+            fg_tile = fg_pad[y:y + tile_size, x:x + tile_size]
+            tile = _normalize_tile_zscore(tile, fg=fg_tile)  # match training mask-restricted normalization
             tile_tensor = torch.from_numpy(tile).float().unsqueeze(0).to(device)
 
             with torch.no_grad():
@@ -278,77 +338,82 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     pred_normal = pred_normal / (norms + 1e-8)
 
     # ==============================================================
-    # FOREGROUND MASK
-    # Priority order (most reliable first):
-    #   1. Model's predicted mask (channel 4) — trained with BCEWithLogitsLoss
-    #      against ground-truth masks during multi-task training.
-    #   2. Dark-reference signal — per-pixel "max LED response above ambient".
-    #   3. Brightness Otsu — fallback for legacy / no dark frame.
-    # All paths share the same cleanup: largest-component, hole fill, soft edge.
+    # FOREGROUND MASK — two-stage "seed + hysteresis grow" design
+    #
+    # Stage A (seed): brightness threshold (dark-ref or Otsu). PRECISE —
+    #   every pixel it keeps is definitely object — but it cuts off dark
+    #   object parts (e.g. a shadowed bottom corner).
+    # Stage B (grow): the model's seg head is accurate NEAR the object but
+    #   hallucinated far away (OOD backgrounds in real photos). So we never
+    #   use it standalone; instead we grow the seed through the model's
+    #   high-confidence region via binary propagation. Dark corners connected
+    #   to the seed are recovered; disconnected background noise is never
+    #   reached. Skipped with --no_pred_mask or 3-channel legacy models.
     # ==============================================================
-    from scipy.ndimage import binary_closing, binary_fill_holes, gaussian_filter, label
+    from scipy.ndimage import (binary_closing, binary_fill_holes, gaussian_filter, label,
+                               binary_propagation, binary_erosion, distance_transform_edt)
 
-    # Path 1: Model's trained mask head (channel 4 of the 4-channel output)
-    has_mask_channel = pred_final.shape[0] >= 4
-    use_model_mask = has_mask_channel and not no_pred_mask
-
-    if use_model_mask:
-        # Mask channel was accumulated as raw logits through the Hanning blend.
-        # Apply sigmoid to get probability map, then threshold at 0.5.
-        mask_logit = pred_final[3]
-        mask_prob = 1.0 / (1.0 + np.exp(-mask_logit))
-        bright_mask = mask_prob > 0.5
-        mask_source = "model-pred"
-        fg_signal_summary = f"prob>0.5, mean_prob={mask_prob.mean():.3f}"
-    elif dark_frame is not None:
-        # Path 2: Dark-reference signal — robust for low-contrast objects
+    # ---- Stage A: brightness seed ----
+    if dark_frame is not None:
+        # Dark-reference signal — per-pixel "max LED response above ambient"
         diff = np.maximum(0.0, lit_full - dark_frame[np.newaxis, ...])
         signal = diff.max(axis=0)
-        bg_floor = float(np.percentile(signal, 5))
-        threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
-        bright_mask = signal > threshold
         mask_source = "dark-ref"
-        fg_signal_summary = f"bg_floor={bg_floor:.3f}, threshold={threshold:.3f}"
     else:
-        # Path 3: Brightness Otsu fallback
         signal = 0.2989 * images[0] + 0.5870 * images[1] + 0.1140 * images[2]
-        bg_floor = float(np.percentile(signal, 5))
-        threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
-        bright_mask = signal > threshold
         mask_source = "Otsu"
-        fg_signal_summary = f"bg_floor={bg_floor:.3f}, threshold={threshold:.3f}"
 
-    # ----- Cleanup pipeline (shared across all three paths) -----
+    bg_floor = float(np.percentile(signal, 5))
+    brightness_threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+    seed = signal > brightness_threshold
 
-    # Step 1: Light closing to fill small gaps in the silhouette
+    # Close small gaps, fill holes, keep the largest connected component
     close_px = max(5, int(min(H, W) * 0.005))
-    bright_mask = binary_closing(bright_mask, structure=np.ones((close_px, close_px)))
-
-    # Step 2: Fill internal holes (e.g., dark spots inside the object)
-    bright_mask = binary_fill_holes(bright_mask)
-
-    # Step 3: Keep ONLY the largest connected component.
-    # Photometric stereo assumes a single foreground object; this kills all
-    # the scattered background blobs that plagued the previous Otsu approach.
-    labeled, n_comp = label(bright_mask)
+    seed = binary_closing(seed, structure=np.ones((close_px, close_px)))
+    seed = binary_fill_holes(seed)
+    labeled, n_comp = label(seed)
     if n_comp > 1:
         sizes = np.bincount(labeled.ravel())
         sizes[0] = 0  # ignore background label
-        largest_label = sizes.argmax()
-        bright_mask = (labeled == largest_label)
+        seed = (labeled == sizes.argmax())
     elif n_comp == 0:
-        # Empty mask — fall back to all-foreground to avoid a black output
-        print("[!] Mask is empty — disabling foreground mask")
-        bright_mask = np.ones_like(bright_mask, dtype=bool)
+        print("[!] Brightness mask is empty — disabling foreground mask")
+        seed = np.ones_like(seed, dtype=bool)
 
-    # Step 4: Soft Gaussian edge for natural blending
+    bright_mask = seed
+
+    # ---- Stage B: hysteresis grow through the model's semantic mask ----
+    has_mask_channel = pred_final.shape[0] >= 4
+    if has_mask_channel and not no_pred_mask and n_comp > 0:
+        mask_logit = pred_final[3]
+        mask_prob = 1.0 / (1.0 + np.exp(-mask_logit))
+        # Conservative propagation medium:
+        #   prob > 0.95  — only the model's most confident pixels
+        #   5px erosion  — breaks thin bridges into background noise
+        #   3% band      — growth limited to the seed's immediate neighbourhood;
+        #                  wide enough for a cut-off corner, too narrow for the
+        #                  object's cast shadow on the background
+        dist = distance_transform_edt(~seed)
+        band = dist < (min(H, W) * 0.03)
+        loose = binary_erosion(mask_prob > 0.95, structure=np.ones((5, 5))) & band
+        grown = binary_propagation(seed, mask=(loose | seed))
+        grown = binary_closing(grown, structure=np.ones((close_px, close_px)))
+        grown = binary_fill_holes(grown)
+        recovered = float(grown.mean()) - float(seed.mean())
+        if recovered > 0.001:
+            print(f"[*] Model-mask hysteresis recovered {recovered:.1%} additional foreground "
+                  f"(dark corners/edges)")
+        bright_mask = grown
+        mask_source += "+model-grow"
+
+    # ---- Soft Gaussian edge for natural blending ----
     blur_sigma = max(1.5, min(H, W) * 0.0015)
     mask_soft = gaussian_filter(bright_mask.astype(np.float32), sigma=blur_sigma)
 
     # Apply mask to the predicted normal map
     pred_normal = pred_normal * mask_soft[np.newaxis, :, :]
-    print(f"[*] Applied {mask_source} mask ({fg_signal_summary}, "
-          f"fg_after_cleanup={bright_mask.mean():.1%})")
+    print(f"[*] Applied {mask_source} mask (threshold={brightness_threshold:.3f}, "
+          f"fg={bright_mask.mean():.1%})")
     # ==============================================================
 
     return pred_normal.transpose(1, 2, 0)
@@ -370,7 +435,8 @@ def run_normal_prediction(args, device):
     print(f"Loaded checkpoint: epoch={epoch}, val_loss={val_loss:.4f}")
     print(f"Parameters: {count_parameters(model):,}")
 
-    images = load_images(input_dir=args.input_dir, image_paths=args.images, max_images=args.max_images)
+    images = load_images(input_dir=args.input_dir, image_paths=args.images,
+                         max_images=args.max_images, linearize=args.linearize)
 
     mask = None
     if args.mask and os.path.exists(args.mask):
@@ -379,21 +445,52 @@ def run_normal_prediction(args, device):
         print(f"Mask loaded: shape={mask.shape}, foreground={int(mask.sum())}")
 
     os.makedirs(args.output, exist_ok=True)
-    
+
     input_tensor = images[:3].transpose(1, 2, 0)
-    
-    t_min = np.percentile(input_tensor, 1) 
+
+    t_min = np.percentile(input_tensor, 1)
     t_max = np.percentile(input_tensor, 99)
-    
-    brightness_factor = 2.0 
-    
+
+    brightness_factor = 2.0
+
     png_tensor = ((input_tensor - t_min) / (t_max - t_min + 1e-8) * 255.0 * brightness_factor)
     png_tensor = png_tensor.clip(0, 255).astype(np.uint8)
-    
+
     png_input_path = os.path.join(args.output, "input.png")
     Image.fromarray(png_tensor, mode='RGB').save(png_input_path)
 
-    pred_normal = predict_normal(model, images, device, tile_size=args.tile_size, overlap=args.overlap)
+    # ==============================================================
+    # SCALE MATCHING: downscale large photos to training scale.
+    # Training: 256px patches on ~512x612 images (object spans ~300-500px).
+    # A 2048px phone photo has the object at ~2x that scale — the model
+    # never saw geometry that "zoomed in". Downscale before prediction,
+    # then upscale the normal map back to the original resolution.
+    # ==============================================================
+    orig_h, orig_w = images.shape[1], images.shape[2]
+    scaled = False
+    if args.resize_max and max(orig_h, orig_w) > args.resize_max:
+        scale = args.resize_max / max(orig_h, orig_w)
+        new_h, new_w = int(round(orig_h * scale)), int(round(orig_w * scale))
+        t_imgs = torch.from_numpy(images).unsqueeze(0)  # (1, C, H, W)
+        t_imgs = F.interpolate(t_imgs, size=(new_h, new_w), mode="area")
+        images = t_imgs[0].numpy()
+        scaled = True
+        print(f"[*] Downscaled {orig_h}x{orig_w} -> {new_h}x{new_w} to match training scale "
+              f"(disable with --resize_max 0)")
+
+    pred_normal = predict_normal(model, images, device, tile_size=args.tile_size,
+                                 overlap=args.overlap, no_pred_mask=args.no_pred_mask)
+
+    # Upscale the normal map back to the original photo resolution
+    if scaled:
+        t_pn = torch.from_numpy(pred_normal.transpose(2, 0, 1)).unsqueeze(0)  # (1, 3, h, w)
+        t_pn = F.interpolate(t_pn, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        pred_normal = t_pn[0].numpy().transpose(1, 2, 0)
+        # Re-normalize to unit vectors (interpolation shortens them); keep masked
+        # background at zero instead of amplifying noise.
+        norms = np.linalg.norm(pred_normal, axis=2, keepdims=True)
+        pred_normal = np.where(norms > 0.1, pred_normal / (norms + 1e-8), 0.0).astype(np.float32)
+        print(f"[*] Upscaled normal map back to {orig_h}x{orig_w}")
 
     if mask is not None:
         pred_normal = pred_normal * mask[..., None]
@@ -540,6 +637,16 @@ def main():
                         help="Ignore the model's predicted mask head and use the "
                              "dark-ref / Otsu heuristic instead. Use this for legacy "
                              "checkpoints (e.g. best_trans.pt) with an unreliable seg head.")
+    parser.add_argument("--linearize", type=str, default="auto",
+                        choices=["auto", "on", "off"],
+                        help="sRGB -> linear conversion for camera photos. 'auto' converts "
+                             ".jpg/.jpeg (phone photos are gamma-encoded; training data is "
+                             "linear). 'on' forces it for all formats, 'off' disables.")
+    parser.add_argument("--resize_max", type=int, default=1024,
+                        help="Downscale inputs whose longest side exceeds this value, predict, "
+                             "then upscale the normal map back. Matches phone photos to the "
+                             "training scale. Set 0 to disable. (DiLiGenT 512x612 images are "
+                             "unaffected by the 1024 default.)")
     args = parser.parse_args()
 
     config = Config(device=args.device)
