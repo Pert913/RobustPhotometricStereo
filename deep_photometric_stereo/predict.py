@@ -167,15 +167,22 @@ def _otsu_threshold(lum_map):
             best_t = b
     return float(best_t)
 
-def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_images=96, dark_frame=None):
+def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_images=96,
+                   dark_frame=None, no_pred_mask=False):
     """
     Predict normal map using Sliding Window with high overlap for zero-tiling.
     Includes Auto-Masking from the Segmentation branch.
 
-    If `dark_frame` is provided (an HxW or HxWx3 image captured with all LEDs off),
-    the segmentation mask is built from the per-pixel "max LED response above ambient"
-    signal across the full input set, which is far more robust for low-contrast or
-    transparent objects than the existing brightness-based Otsu fallback.
+    Masking priority (most reliable first):
+      1. Model's predicted mask head (channel 4) — used by default for new
+         multi-task checkpoints. Cleaned with largest-connected-component
+         selection and hole filling.
+      2. Dark-frame reference (`dark_frame` provided) — robust for low-contrast
+         or transparent objects.
+      3. Otsu brightness heuristic — fallback only.
+
+    Pass `no_pred_mask=True` to ignore the model mask and use paths 2/3 only
+    (legacy behavior for `best_trans.pt` and other unreliable seg heads).
     """
     model.eval()
 
@@ -272,60 +279,76 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
 
     # ==============================================================
     # FOREGROUND MASK
-    # Two paths:
-    #   1. Dark-reference (preferred): foreground is "any pixel that responded
-    #      to at least one LED above ambient". Robust to low-contrast objects.
-    #   2. Brightness Otsu (fallback): foreground is "bright in the lit shots".
-    # Both share the same morphology (closing, fill, center-distance, blur).
+    # Priority order (most reliable first):
+    #   1. Model's predicted mask (channel 4) — trained with BCEWithLogitsLoss
+    #      against ground-truth masks during multi-task training.
+    #   2. Dark-reference signal — per-pixel "max LED response above ambient".
+    #   3. Brightness Otsu — fallback for legacy / no dark frame.
+    # All paths share the same cleanup: largest-component, hole fill, soft edge.
     # ==============================================================
-    from scipy.ndimage import binary_closing, binary_fill_holes, gaussian_filter, label, center_of_mass
+    from scipy.ndimage import binary_closing, binary_fill_holes, gaussian_filter, label
 
-    if dark_frame is not None:
-        # Per-pixel max LED-driven response across the full sequence.
-        # Clipping at 0 throws away pixels where ambient actually decreased
-        # (e.g. small AE drift between dark and lit shots).
-        diff = np.maximum(0.0, lit_full - dark_frame[np.newaxis, ...])  # (N, H, W)
-        signal = diff.max(axis=0)                                       # (H, W)
+    # Path 1: Model's trained mask head (channel 4 of the 4-channel output)
+    has_mask_channel = pred_final.shape[0] >= 4
+    use_model_mask = has_mask_channel and not no_pred_mask
+
+    if use_model_mask:
+        # Mask channel was accumulated as raw logits through the Hanning blend.
+        # Apply sigmoid to get probability map, then threshold at 0.5.
+        mask_logit = pred_final[3]
+        mask_prob = 1.0 / (1.0 + np.exp(-mask_logit))
+        bright_mask = mask_prob > 0.5
+        mask_source = "model-pred"
+        fg_signal_summary = f"prob>0.5, mean_prob={mask_prob.mean():.3f}"
+    elif dark_frame is not None:
+        # Path 2: Dark-reference signal — robust for low-contrast objects
+        diff = np.maximum(0.0, lit_full - dark_frame[np.newaxis, ...])
+        signal = diff.max(axis=0)
+        bg_floor = float(np.percentile(signal, 5))
+        threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+        bright_mask = signal > threshold
         mask_source = "dark-ref"
+        fg_signal_summary = f"bg_floor={bg_floor:.3f}, threshold={threshold:.3f}"
     else:
-        # Luminance weights blue at only 11%, so dark-blue fabric backgrounds stay dim
-        # while the LED-lit object (with strong R and G components) remains bright.
+        # Path 3: Brightness Otsu fallback
         signal = 0.2989 * images[0] + 0.5870 * images[1] + 0.1140 * images[2]
+        bg_floor = float(np.percentile(signal, 5))
+        threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+        bright_mask = signal > threshold
         mask_source = "Otsu"
+        fg_signal_summary = f"bg_floor={bg_floor:.3f}, threshold={threshold:.3f}"
 
-    # Otsu picks the bimodal split between dim background and lit foreground.
-    # Floor at max(5th-percentile * 1.5) prevents over-segmentation in uniform images.
-    bg_floor = float(np.percentile(signal, 5))
-    brightness_threshold = max(bg_floor * 1.5, min(_otsu_threshold(signal), 0.50))
+    # ----- Cleanup pipeline (shared across all three paths) -----
 
-    bright_mask = signal > brightness_threshold
-
-    # Scale the closing kernel to image size so gaps get bridged regardless of resolution
-    close_px = max(15, int(min(H, W) * 0.007))   # ~0.7% of shorter side
+    # Step 1: Light closing to fill small gaps in the silhouette
+    close_px = max(5, int(min(H, W) * 0.005))
     bright_mask = binary_closing(bright_mask, structure=np.ones((close_px, close_px)))
+
+    # Step 2: Fill internal holes (e.g., dark spots inside the object)
     bright_mask = binary_fill_holes(bright_mask)
 
-    # Remove any remaining stray-light blobs far from the image center
+    # Step 3: Keep ONLY the largest connected component.
+    # Photometric stereo assumes a single foreground object; this kills all
+    # the scattered background blobs that plagued the previous Otsu approach.
     labeled, n_comp = label(bright_mask)
     if n_comp > 1:
-        img_cy, img_cx = H / 2.0, W / 2.0
-        max_dist = np.sqrt((H / 2.0) ** 2 + (W / 2.0) ** 2)
-        min_size = int(bright_mask.size * 0.001)
-        keep = np.zeros_like(bright_mask, dtype=bool)
-        for i in range(1, n_comp + 1):
-            comp = labeled == i
-            if comp.sum() < min_size:
-                continue
-            cy_c, cx_c = center_of_mass(comp)
-            if np.sqrt((cy_c - img_cy) ** 2 + (cx_c - img_cx) ** 2) / max_dist < 0.45:
-                keep |= comp
-        bright_mask = keep
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0  # ignore background label
+        largest_label = sizes.argmax()
+        bright_mask = (labeled == largest_label)
+    elif n_comp == 0:
+        # Empty mask — fall back to all-foreground to avoid a black output
+        print("[!] Mask is empty — disabling foreground mask")
+        bright_mask = np.ones_like(bright_mask, dtype=bool)
 
-    # Scale Gaussian blur radius to image resolution
-    blur_sigma = max(3.0, min(H, W) * 0.002)
+    # Step 4: Soft Gaussian edge for natural blending
+    blur_sigma = max(1.5, min(H, W) * 0.0015)
     mask_soft = gaussian_filter(bright_mask.astype(np.float32), sigma=blur_sigma)
+
+    # Apply mask to the predicted normal map
     pred_normal = pred_normal * mask_soft[np.newaxis, :, :]
-    print(f"[*] Applied {mask_source} mask (bg_floor={bg_floor:.3f}, threshold={brightness_threshold:.3f}, fg={bright_mask.mean():.1%})")
+    print(f"[*] Applied {mask_source} mask ({fg_signal_summary}, "
+          f"fg_after_cleanup={bright_mask.mean():.1%})")
     # ==============================================================
 
     return pred_normal.transpose(1, 2, 0)
@@ -513,6 +536,10 @@ def main():
     parser.add_argument("--model_type", type=str, default="auto",
                         choices=["auto", "transunet", "lightweight", "swin"],
                         help="Model architecture (auto-detected from checkpoint by default)")
+    parser.add_argument("--no_pred_mask", action="store_true",
+                        help="Ignore the model's predicted mask head and use the "
+                             "dark-ref / Otsu heuristic instead. Use this for legacy "
+                             "checkpoints (e.g. best_trans.pt) with an unreliable seg head.")
     args = parser.parse_args()
 
     config = Config(device=args.device)
