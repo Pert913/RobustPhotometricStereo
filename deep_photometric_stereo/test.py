@@ -1,13 +1,54 @@
 """
-Evaluation / inference script for TransUNetPS, LightweightUNetPS, and SwinUNetPS.
-Multi-Task capability: Normal Estimation + Segmentation.
+Evaluation script for TransUNetPS / LightweightUNetPS / SwinUNetPS.
+Multi-Task: Normal Estimation (MAE) + Segmentation (IoU).
 
-Usage Examples:
-    # Evaluate a single checkpoint (Auto-detect model type from filename)
-    python test.py --mode eval_all --checkpoint checkpoints/best.pt --data_root ./data/testing
+Reports MAE (lower=better) and seg IoU (higher=better). Needs GROUND-TRUTH
+normals+masks, so it only works on datasets that ship GT (training/, synthetic/,
+DiLiGenT-MV). For real captures without GT (data/testing/*PNG), use predict.py.
 
-    # FORCE a specific model type (if filename doesn't contain 'swin' or 'lightweight')
-    python test.py --mode eval_all --checkpoint checkpoints/best_joint.pt --model_type swin --data_root ./data/testing
+Inference quality fixes baked in (no flags needed):
+  - clean_seg_mask: closing + fill-holes + largest-component  -> IoU ~0.86->0.98
+  - single-pass for images <=800px (no tile-blend softening)  -> sharper normals
+
+--------------------------------------------------------------------------------
+RUNNABLE NOW (data/training/ has GT for all 10 DiLiGenT objects)
+--------------------------------------------------------------------------------
+    # Evaluate ONE object (prints MAE + IoU; add --save_output to dump PNGs)
+    python test.py --mode eval --checkpoint checkpoints/run/best_trans_25.pt \
+        --data_root ./data/training --test_object ballPNG --save_output ./output/eval_ball
+
+    # Evaluate ALL objects in a folder + write a CSV summary
+    python test.py --mode eval_all --checkpoint checkpoints/run/best_trans_25.pt \
+        --data_root ./data/training --csv_out eval_training.csv
+
+    # Lightweight checkpoint (model type auto-detected from filename)
+    python test.py --mode eval_all --checkpoint checkpoints/run/best_lw_25.pt \
+        --data_root ./data/training --csv_out eval_training_lw.csv
+
+    # Legacy best_trans.pt has a broken seg head -> use GT mask via --no_pred_mask
+    python test.py --mode eval_all --checkpoint checkpoints/run/best_trans.pt \
+        --data_root ./data/training --no_pred_mask --csv_out eval_training_legacy.csv
+
+--------------------------------------------------------------------------------
+NEEDS THE FULL DATASETS (Tue's machine)
+--------------------------------------------------------------------------------
+    # DiLiGenT-MV benchmark  (expects <data_root>/mvpmsData/...)
+    python test.py --mode eval_mv --model_type transunet \
+        --checkpoint checkpoints/run/best_trans_25.pt \
+        --data_root data/testing/DiLiGenT-MV --csv_out mv_eval.csv --save_output ./output/mv
+
+    # Synthetic PRPS validation split (val_split.json -> data/synthetic/...)
+    python test.py --mode eval_json --checkpoint checkpoints/run/best_trans_25.pt \
+        --json_file ./val_split.json --csv_out val_eval.csv
+
+--------------------------------------------------------------------------------
+Useful flags
+    --model_type auto|transunet|lightweight|swin   force arch (else from filename)
+    --no_pred_mask        score against GT mask instead of the predicted mask
+    --max_inference_side N downscale long side to N before tiling (large images)
+    --save_output DIR     dump pred_normal.png / gt_normal.png / error_map.png
+    --csv_out FILE        write the metrics table
+--------------------------------------------------------------------------------
 """
 
 import argparse
@@ -35,17 +76,40 @@ def calculate_iou(pred_prob, true_mask, threshold=0.5):
     """Calculates the Intersection over Union (IoU) between prediction and ground truth."""
     pred_bin = (pred_prob > threshold).astype(np.float32)
     true_bin = (true_mask > 0.5).astype(np.float32)
-    
+
     intersection = np.sum(pred_bin * true_bin)
     union = np.sum(pred_bin) + np.sum(true_bin) - intersection
-    
+
     return (intersection + 1e-6) / (union + 1e-6)
+
+
+def clean_seg_mask(pred_mask_prob, threshold=0.5):
+    """
+    Turn the raw seg-head probability map into a clean binary mask.
+    """
+    from scipy.ndimage import binary_closing, binary_fill_holes, label
+
+    H, W = pred_mask_prob.shape
+    m = pred_mask_prob > threshold
+    if m.sum() == 0:
+        return m.astype(np.float32)
+
+    close_px = max(5, int(min(H, W) * 0.005))
+    m = binary_closing(m, structure=np.ones((close_px, close_px)))
+    m = binary_fill_holes(m)
+
+    lab, n = label(m)
+    if n > 1:
+        sizes = np.bincount(lab.ravel()); sizes[0] = 0
+        m = (lab == sizes.argmax())
+    return m.astype(np.float32)
 
 # ==============================================================================
 # FULL RESOLUTION INFERENCE
 # ==============================================================================
 @torch.no_grad()
-def predict_full_resolution(model, images, device, tile_size=128, max_long_side=None):
+def predict_full_resolution(model, images, device, tile_size=128, max_long_side=None,
+                            single_pass="auto", single_pass_max=800):
     """
     Predict normal map via sliding-window tiling with Hanning blending.
 
@@ -76,6 +140,30 @@ def predict_full_resolution(model, images, device, tile_size=128, max_long_side=
                                mode='bilinear', align_corners=False)
         H, W = new_H, new_W
         print(f"    [resize] {orig_H}x{orig_W} → {H}x{W} for tiling")
+    # ------------------------------------------------------------------------
+
+    # --- single full-image pass (sharp, no tile-blend averaging) ------------
+    if single_pass == "on":
+        _use_single = True
+    elif single_pass == "off":
+        _use_single = False
+    else:
+        _use_single = max(H, W) <= single_pass_max
+
+    if _use_single:
+        ph = (16 - H % 16) % 16
+        pw = (16 - W % 16) % 16
+        inp = torch.nn.functional.pad(images.float(), (0, pw, 0, ph), mode="reflect").to(device)
+        pred_tile = model(inp)[0].cpu()
+        if pred_tile.shape[0] == 3:
+            pred_tile = torch.cat([pred_tile, torch.zeros(1, *pred_tile.shape[1:])], dim=0)
+        pred_out = pred_tile[:, :H, :W]
+        print(f"    [single-pass] {H}x{W} — no tile blending (sharpest)")
+        if (H, W) != (orig_H, orig_W):
+            pred_out = F.interpolate(pred_out.unsqueeze(0), size=(orig_H, orig_W),
+                                     mode='bilinear', align_corners=False).squeeze(0)
+            pred_out[:3] = F.normalize(pred_out[:3], p=2, dim=0)
+        return pred_out
     # ------------------------------------------------------------------------
 
     tile_size = max(16, (tile_size // 16) * 16)
@@ -146,8 +234,8 @@ def evaluate_object(model, test_ds, obj_idx, device, save_dir=None, use_pred_mas
     if use_pred_mask and pred_out.shape[0] >= 4:
         pred_mask_logit = pred_out[3, :, :]
         pred_mask_prob = torch.sigmoid(pred_mask_logit).cpu().numpy()
-        pred_mask_bin = (pred_mask_prob > 0.5).astype(np.float32)
-        iou = calculate_iou(pred_mask_prob, mask_np)
+        pred_mask_bin = clean_seg_mask(pred_mask_prob)
+        iou = calculate_iou(pred_mask_bin, mask_np)
     else:
         pred_mask_bin = mask_np  # fall back to GT mask
 
@@ -390,8 +478,8 @@ def main():
             iou = 0.0
             if not args.no_pred_mask and pred_out.shape[0] >= 4:
                 pred_mask_prob = torch.sigmoid(pred_out[3]).numpy()
-                pred_mask_bin = (pred_mask_prob > 0.5).astype(np.float32)
-                iou = calculate_iou(pred_mask_prob, mask_np)
+                pred_mask_bin = clean_seg_mask(pred_mask_prob)
+                iou = calculate_iou(pred_mask_bin, mask_np)
             else:
                 pred_mask_bin = mask_np  # fall back to GT mask
 

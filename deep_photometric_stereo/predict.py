@@ -7,12 +7,32 @@ Supports two modes:
 
 Usage:
     # ============================================================================
-    # REAL PHONE PHOTO (iPhone/Android JPEG) — RECOMMENDED COMMAND
-    # Auto-applies: sRGB->linear conversion, Otsu foreground normalization,
-    # downscale-to-training-scale (then upscales the result back).
-    # --no_pred_mask: model mask heads over-segment on real photos; Otsu is accurate.
+    # RECOMMENDED COMMAND (real phone photo OR DiLiGenT image)
+    # Just point at the image — no flags needed. The default pipeline auto-applies:
+    #   - sRGB->linear conversion (camera JPEGs)
+    #   - Otsu foreground normalization
+    #   - downscale-to-training-scale (then upscales the result back)
+    #   - ADAPTIVE seg-head mask: trusts the model mask when it agrees with
+    #     brightness (in-distribution -> recovers dim object parts like dark
+    #     corners/hands), and falls back to a conservative brightness grow when
+    #     the head over-segments (out-of-distribution -> no background leak).
+    # The model mask now improves BOTH the charger and the bear, so do NOT pass
+    # --no_pred_mask for the 25-image checkpoints (it is only needed for the
+    # legacy best_trans.pt). The --no_pred_mask variants below are kept only so
+    # you can compare/contrast.
     # ============================================================================
-    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/target/APC_0014.jpg --output ./output/my_test --no_pred_mask
+
+    # --- RECOMMENDED (default, uses adaptive model mask) ---
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/target/APC_0014.jpg --output ./output/charge
+
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/mask_problem/input_object_image.png --output ./output/bear_fixed
+
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/charger_test_2/input_charger_2.png --output ./output/charger_2_output
+
+    # --- For comparison only (brightness Otsu mask, no seg-head) ---
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/target/APC_0014.jpg --output ./output/charge_no_pred_mask --no_pred_mask
+
+    python predict.py --checkpoint checkpoints/run/best_trans_25.pt --images data/testing/thanh_test/mask_problem/input_object_image.png --output ./output/bear_fixed_no_pred_mask --no_pred_mask
 
     # Checkpoints to compare:
     #   checkpoints/run/best_trans.pt     (transunet,   Val MAE 7.9 — LEGACY mask head, ALWAYS use --no_pred_mask)
@@ -209,13 +229,17 @@ def _otsu_threshold(lum_map):
     return float(best_t)
 
 def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_images=96,
-                   dark_frame=None, no_pred_mask=False):
+                   dark_frame=None, no_pred_mask=False, single_pass="auto",
+                   single_pass_max=800):
     """
     Predict normal map using Sliding Window with high overlap for zero-tiling.
     Includes Auto-Masking from the Segmentation branch.
 
     Pass `no_pred_mask=True` to skip Stage B and use the pure brightness mask
     (required for `best_trans.pt` whose legacy coupled seg head is unreliable).
+
+    single_pass: "auto" (default) runs one full-image forward pass when the image
+        fits (max side <= single_pass_max), which is SHARPER than tiling
     """
     model.eval()
 
@@ -292,45 +316,72 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
         print(f"[*] Foreground estimate for normalization: {fg_frac:.1%} of image "
               f"(otsu_t={otsu_t:.3f})")
 
-    pad_top = tile_size // 2
-    pad_bottom = (tile_size - H % stride) % stride + tile_size // 2
-    pad_left = tile_size // 2
-    pad_right = (tile_size - W % stride) % stride + tile_size // 2
+    # ==============================================================
+    # INFERENCE: single full-image pass (sharp) vs sliding-window tiling.
+    # Single pass avoids the Hanning-blend averaging that low-pass-filters
+    # the result, so small objects (DiLiGenT, the bear) come out noticeably
+    # sharper. Large images stay on tiling for memory + scale reasons, which
+    # keeps previously validated big-photo results unchanged.
+    # ==============================================================
+    if single_pass == "on":
+        use_single = True
+    elif single_pass == "off":
+        use_single = False
+    else:  # auto
+        use_single = max(H, W) <= single_pass_max
 
-    images_pad = np.pad(images, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
-    fg_pad = np.pad(fg_global, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
-    _, pH, pW = images_pad.shape
+    if use_single:
+        s = _normalize_tile_zscore(images.copy(), fg=fg_global)
+        ph = (16 - H % 16) % 16
+        pw = (16 - W % 16) % 16
+        inp = np.pad(s, ((0, 0), (0, ph), (0, pw)), mode="reflect")
+        with torch.no_grad():
+            out = model(torch.from_numpy(inp).float().unsqueeze(0).to(device))[0].cpu().numpy()
+        out = out[:, :H, :W]
+        if out.shape[0] == 3:
+            out = np.concatenate([out, np.zeros((1, H, W), dtype=np.float32)], axis=0)
+        pred_final = out
+        print(f"[*] Single-pass inference ({H}x{W}) — no tile blending (sharpest)")
+    else:
+        pad_top = tile_size // 2
+        pad_bottom = (tile_size - H % stride) % stride + tile_size // 2
+        pad_left = tile_size // 2
+        pad_right = (tile_size - W % stride) % stride + tile_size // 2
 
-    # FIX: Initialize 4-channel accumulation array (instead of 3) to capture the Mask channel
-    pred_accum = np.zeros((4, pH, pW), dtype=np.float32)
-    weight_accum = np.zeros((1, pH, pW), dtype=np.float32)
+        images_pad = np.pad(images, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
+        fg_pad = np.pad(fg_global, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect")
+        _, pH, pW = images_pad.shape
 
-    window_1d = np.hanning(tile_size).astype(np.float32) ** 1.5
-    window_2d = np.outer(window_1d, window_1d)
-    window_3d = window_2d[np.newaxis, :, :]
+        # FIX: Initialize 4-channel accumulation array (instead of 3) to capture the Mask channel
+        pred_accum = np.zeros((4, pH, pW), dtype=np.float32)
+        weight_accum = np.zeros((1, pH, pW), dtype=np.float32)
 
-    y_positions = list(range(0, pH - tile_size + 1, stride))
-    x_positions = list(range(0, pW - tile_size + 1, stride))
+        window_1d = np.hanning(tile_size).astype(np.float32) ** 1.5
+        window_2d = np.outer(window_1d, window_1d)
+        window_3d = window_2d[np.newaxis, :, :]
 
-    for y in y_positions:
-        for x in x_positions:
-            tile = images_pad[:, y:y + tile_size, x:x + tile_size].copy()
-            fg_tile = fg_pad[y:y + tile_size, x:x + tile_size]
-            tile = _normalize_tile_zscore(tile, fg=fg_tile)  # match training mask-restricted normalization
-            tile_tensor = torch.from_numpy(tile).float().unsqueeze(0).to(device)
+        y_positions = list(range(0, pH - tile_size + 1, stride))
+        x_positions = list(range(0, pW - tile_size + 1, stride))
 
-            with torch.no_grad():
-                pred_tile = model(tile_tensor)[0]
-                pred_np = pred_tile.cpu().numpy()
+        for y in y_positions:
+            for x in x_positions:
+                tile = images_pad[:, y:y + tile_size, x:x + tile_size].copy()
+                fg_tile = fg_pad[y:y + tile_size, x:x + tile_size]
+                tile = _normalize_tile_zscore(tile, fg=fg_tile)  # match training mask-restricted normalization
+                tile_tensor = torch.from_numpy(tile).float().unsqueeze(0).to(device)
 
-            # FIX: Accumulate all channels (3 Normal channels + 1 Mask channel)
-            channels_out = pred_np.shape[0]
-            pred_accum[:channels_out, y:y + tile_size, x:x + tile_size] += pred_np * window_3d
-            weight_accum[:, y:y + tile_size, x:x + tile_size] += window_3d
+                with torch.no_grad():
+                    pred_tile = model(tile_tensor)[0]
+                    pred_np = pred_tile.cpu().numpy()
 
-    weight_accum = np.clip(weight_accum, 1e-5, None)
-    pred_blended = pred_accum / weight_accum
-    pred_final = pred_blended[:, pad_top:pad_top + H, pad_left:pad_left + W]
+                # FIX: Accumulate all channels (3 Normal channels + 1 Mask channel)
+                channels_out = pred_np.shape[0]
+                pred_accum[:channels_out, y:y + tile_size, x:x + tile_size] += pred_np * window_3d
+                weight_accum[:, y:y + tile_size, x:x + tile_size] += window_3d
+
+        weight_accum = np.clip(weight_accum, 1e-5, None)
+        pred_blended = pred_accum / weight_accum
+        pred_final = pred_blended[:, pad_top:pad_top + H, pad_left:pad_left + W]
 
     # Extract the 3 Normal Map channels
     pred_normal = pred_final[:3]
@@ -382,29 +433,65 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
 
     bright_mask = seed
 
-    # ---- Stage B: hysteresis grow through the model's semantic mask ----
+    # ---- Stage B: grow seed through the model's semantic mask ----
+    # The seg head's reliability is input-dependent, chosen by the ratio
+    # seg_fg / brightness_fg:
+    #   ratio < 1.8  -> in-distribution (dark-bg PS). The head agrees with
+    #                   brightness and is accurate (IoU ~0.98). TRUST it:
+    #                   connectivity-grow the seed through all seg>0.5 pixels,
+    #                   recovering dim object parts (shadowed hands/corners).
+    #   ratio >= 1.8 -> OOD real photo. The head over-segments and its halo
+    #                   CONNECTS to the object through tiled inference, so a
+    #                   plain connectivity flood would leak. Use the
+    #                   CONSERVATIVE grow: only high-confidence (>0.95) seg
+    #                   pixels, eroded to break thin bridges, within a distance
+    #                   band of the seed. Recovers attached corners/prongs
+    #                   without admitting the background halo.
     has_mask_channel = pred_final.shape[0] >= 4
     if has_mask_channel and not no_pred_mask and n_comp > 0:
         mask_logit = pred_final[3]
         mask_prob = 1.0 / (1.0 + np.exp(-mask_logit))
-        # Conservative propagation medium:
-        #   prob > 0.95  — only the model's most confident pixels
-        #   5px erosion  — breaks thin bridges into background noise
-        #   3% band      — growth limited to the seed's immediate neighbourhood;
-        #                  wide enough for a cut-off corner, too narrow for the
-        #                  object's cast shadow on the background
-        dist = distance_transform_edt(~seed)
-        band = dist < (min(H, W) * 0.03)
-        loose = binary_erosion(mask_prob > 0.95, structure=np.ones((5, 5))) & band
-        grown = binary_propagation(seed, mask=(loose | seed))
-        grown = binary_closing(grown, structure=np.ones((close_px, close_px)))
-        grown = binary_fill_holes(grown)
-        recovered = float(grown.mean()) - float(seed.mean())
-        if recovered > 0.001:
-            print(f"[*] Model-mask hysteresis recovered {recovered:.1%} additional foreground "
-                  f"(dark corners/edges)")
-        bright_mask = grown
-        mask_source += "+model-grow"
+        seg_frac = float((mask_prob > 0.5).mean())
+        bright_frac = max(float(seed.mean()), 1e-6)
+        ratio = seg_frac / bright_frac
+
+        if ratio < 1.8:
+            # In-distribution: trust the seg head (connectivity grow, seg>0.5).
+            seg_bin = mask_prob > 0.5
+            grown = binary_propagation(seed, mask=(seed | seg_bin))
+            grown = binary_closing(grown, structure=np.ones((close_px, close_px)))
+            grown = binary_fill_holes(grown)
+            glab, gn = label(grown)
+            if gn > 1:
+                gsizes = np.bincount(glab.ravel()); gsizes[0] = 0
+                grown = (glab == gsizes.argmax())
+            bright_mask = grown
+            mask_source += f"+seg-trust(ratio={ratio:.2f})"
+            if abs(float(grown.mean()) - float(seed.mean())) > 0.001:
+                print(f"[*] Seg-trust grow: foreground {seed.mean():.1%} -> {grown.mean():.1%} "
+                      f"(ratio={ratio:.2f})")
+        else:
+            # OOD over-segmentation: conservative high-confidence band grow.
+            # Recovers attached dark corners that touch the seed, without
+            # admitting the connected background halo or the object's cast
+            # shadow on the table.
+            #   prob > 0.95  — only the model's most confident pixels
+            #   5px erosion  — breaks thin bridges into background noise
+            #   3% band      — tight neighbourhood; wider bands leak the cast
+            #                  shadow (shadow is as dark as dim object parts,
+            #                  so brightness can't separate them — keep it tight)
+            dist = distance_transform_edt(~seed)
+            band = dist < (min(H, W) * 0.03)
+            loose = binary_erosion(mask_prob > 0.95, structure=np.ones((5, 5))) & band
+            grown = binary_propagation(seed, mask=(loose | seed))
+            grown = binary_closing(grown, structure=np.ones((close_px, close_px)))
+            grown = binary_fill_holes(grown)
+            recovered = float(grown.mean()) - float(seed.mean())
+            if recovered > 0.001:
+                print(f"[*] Model-mask hysteresis recovered {recovered:.1%} additional foreground "
+                      f"(dark corners/edges, ratio={ratio:.2f})")
+            bright_mask = grown
+            mask_source += f"+model-grow(ratio={ratio:.2f})"
 
     # ---- Soft Gaussian edge for natural blending ----
     blur_sigma = max(1.5, min(H, W) * 0.0015)
@@ -479,7 +566,8 @@ def run_normal_prediction(args, device):
               f"(disable with --resize_max 0)")
 
     pred_normal = predict_normal(model, images, device, tile_size=args.tile_size,
-                                 overlap=args.overlap, no_pred_mask=args.no_pred_mask)
+                                 overlap=args.overlap, no_pred_mask=args.no_pred_mask,
+                                 single_pass=args.single_pass)
 
     # Upscale the normal map back to the original photo resolution
     if scaled:
@@ -647,6 +735,13 @@ def main():
                              "then upscale the normal map back. Matches phone photos to the "
                              "training scale. Set 0 to disable. (DiLiGenT 512x612 images are "
                              "unaffected by the 1024 default.)")
+    parser.add_argument("--single_pass", type=str, default="auto",
+                        choices=["auto", "on", "off"],
+                        help="Run a single full-image forward pass (sharper, no tile-blend "
+                             "averaging) instead of sliding-window tiling. 'auto' (default) "
+                             "uses single-pass when the longest side <= 800 (covers DiLiGenT "
+                             "objects and the bear); larger images (e.g. downscaled phone "
+                             "photos at 1024) keep tiling so validated results are unchanged.")
     args = parser.parse_args()
 
     config = Config(device=args.device)
