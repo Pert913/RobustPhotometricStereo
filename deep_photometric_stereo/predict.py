@@ -433,20 +433,22 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
 
     bright_mask = seed
 
-    # ---- Stage B: grow seed through the model's semantic mask ----
-    # The seg head's reliability is input-dependent, chosen by the ratio
-    # seg_fg / brightness_fg:
-    #   ratio < 1.8  -> in-distribution (dark-bg PS). The head agrees with
+    # ---- Stage B: grow the bright seed to recover dim-but-lit object parts ----
+    # Strategy depends on the ratio seg_fg / brightness_fg:
+    #   ratio < 1.8  -> in-distribution (dark-bg PS). The seg head agrees with
     #                   brightness and is accurate (IoU ~0.98). TRUST it:
     #                   connectivity-grow the seed through all seg>0.5 pixels,
     #                   recovering dim object parts (shadowed hands/corners).
-    #   ratio >= 1.8 -> OOD real photo. The head over-segments and its halo
-    #                   CONNECTS to the object through tiled inference, so a
-    #                   plain connectivity flood would leak. Use the
-    #                   CONSERVATIVE grow: only high-confidence (>0.95) seg
-    #                   pixels, eroded to break thin bridges, within a distance
-    #                   band of the seed. Recovers attached corners/prongs
-    #                   without admitting the background halo.
+    #   ratio >= 1.8 -> OOD real photo. The seg head over-segments a CONFIDENT
+    #                   halo of dark background fabric (seg>0.95 on brightness
+    #                   ~0.03), so it cannot be used to grow without leaking.
+    #                   Instead use BRIGHTNESS-HYSTERESIS: grow the seed into
+    #                   pixels CONNECTED to it whose brightness exceeds a lower
+    #                   floor (thr * 0.4). Dim-but-lit object faces (pink charger
+    #                   sides) are recovered; the much darker fabric/cast-shadow
+    #                   (~0.03, below the floor) stays out. No seg head, no
+    #                   distance band — connectivity + a brightness floor are a
+    #                   cleaner, more complete discriminator on OOD inputs.
     has_mask_channel = pred_final.shape[0] >= 4
     if has_mask_channel and not no_pred_mask and n_comp > 0:
         mask_logit = pred_final[3]
@@ -471,27 +473,24 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
                 print(f"[*] Seg-trust grow: foreground {seed.mean():.1%} -> {grown.mean():.1%} "
                       f"(ratio={ratio:.2f})")
         else:
-            # OOD over-segmentation: conservative high-confidence band grow.
-            # Recovers attached dark corners that touch the seed, without
-            # admitting the connected background halo or the object's cast
-            # shadow on the table.
-            #   prob > 0.95  — only the model's most confident pixels
-            #   5px erosion  — breaks thin bridges into background noise
-            #   3% band      — tight neighbourhood; wider bands leak the cast
-            #                  shadow (shadow is as dark as dim object parts,
-            #                  so brightness can't separate them — keep it tight)
-            dist = distance_transform_edt(~seed)
-            band = dist < (min(H, W) * 0.03)
-            loose = binary_erosion(mask_prob > 0.95, structure=np.ones((5, 5))) & band
-            grown = binary_propagation(seed, mask=(loose | seed))
+            # OOD: brightness-hysteresis grow (seg head unreliable here).
+            # Grow the seed into connected pixels brighter than thr*0.4 — the
+            # dim-but-lit object faces — while the darker fabric/shadow stays out.
+            bright_floor = brightness_threshold * 0.4
+            medium = signal > bright_floor
+            grown = binary_propagation(seed, mask=medium)
             grown = binary_closing(grown, structure=np.ones((close_px, close_px)))
             grown = binary_fill_holes(grown)
+            glab, gn = label(grown)
+            if gn > 1:
+                gsizes = np.bincount(glab.ravel()); gsizes[0] = 0
+                grown = (glab == gsizes.argmax())
             recovered = float(grown.mean()) - float(seed.mean())
             if recovered > 0.001:
-                print(f"[*] Model-mask hysteresis recovered {recovered:.1%} additional foreground "
-                      f"(dark corners/edges, ratio={ratio:.2f})")
+                print(f"[*] Brightness-hysteresis grow recovered {recovered:.1%} foreground "
+                      f"(dim-but-lit object faces, floor={bright_floor:.3f}, ratio={ratio:.2f})")
             bright_mask = grown
-            mask_source += f"+model-grow(ratio={ratio:.2f})"
+            mask_source += f"+bright-hyst(ratio={ratio:.2f})"
 
     # ---- Soft Gaussian edge for natural blending ----
     blur_sigma = max(1.5, min(H, W) * 0.0015)
