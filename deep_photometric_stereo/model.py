@@ -1,5 +1,5 @@
 """
-TransUNet, Lightweight, and SwinUNet architectures for Single-Image Input.
+TransUNet, Lightweight, Global-Attention, and Swin-backbone architectures for Single-Image Input.
 
 Architecture Flow (Single Image Configuration):
     - Input: 1 Color Image (3 channels RGB)
@@ -371,10 +371,12 @@ class LightweightUNetPS(nn.Module):
 
 
 # ==============================================================================
-# MODEL 3: SWIN-UNET 
+# MODEL 3: GLOBAL-ATTENTION U-NET (CNN encoder + wide global-attention bottleneck)
+# Formerly mislabelled "Swin"; contains no windowed/shifted attention or patch
+# merging. See MODEL 4 for the genuine Swin Transformer backbone.
 # ==============================================================================
 
-class SwinUNetPS(nn.Module):
+class GlobalAttnUNetPS(nn.Module):
     def __init__(self, config=None):
         super().__init__()
         enc_ch = [64, 128, 256, 512]
@@ -438,13 +440,86 @@ class SwinUNetPS(nn.Module):
         return self.head(x)
 
 # ==============================================================================
+# MODEL 4: SWIN-UNET (genuine Swin Transformer backbone)
+# ==============================================================================
+
+class SwinBackboneUNetPS(nn.Module):
+    """
+    A true Swin-Unet backbone swap: the CNN SharedEncoder is replaced by a
+    genuine hierarchical Swin Transformer encoder (windowed W-MSA / shifted-window
+    SW-MSA / patch merging, via timm), while the proven RobustDecoderBlock decoder
+    and MultiTaskHead are reused unchanged so the comparison against TransUNetPS /
+    LightweightUNetPS isolates the encoder.
+
+    Swin produces features at strides {4, 8, 16, 32}; a light conv stem supplies the
+    missing stride-1 / stride-2 skips so the decoder can restore full resolution.
+    Inputs are padded to a multiple of 32 and the output is cropped back, which lets
+    the same model run on 256-px training patches and native-resolution captures.
+    """
+    def __init__(self, config=None):
+        super().__init__()
+        import timm
+        variant = getattr(config, 'swin_variant', 'swin_tiny_patch4_window7_224')
+        pretrained = getattr(config, 'swin_pretrained', False)
+        in_ch = getattr(config, 'in_channels', 3)
+
+        self.encoder = timm.create_model(
+            variant, pretrained=pretrained, num_classes=0, in_chans=in_ch,
+            strict_img_size=False,   # relax 224-only assert + enable dynamic SW-MSA masks
+            dynamic_img_pad=True,
+        )
+        self._feat_indices = [0, 1, 2, 3]
+
+        # probe encoder channels (variant-agnostic, no hardcoding)
+        with torch.no_grad():
+            probe = torch.zeros(1, in_ch, 64, 64)
+            feats = self.encoder.forward_intermediates(
+                probe, indices=self._feat_indices, intermediates_only=True)
+        c = [f.shape[1] for f in feats]   # e.g. [96, 192, 384, 768] for swin_tiny
+
+        stem_ch1, stem_ch2 = 32, 64
+        self.stem1 = Conv2dReLU(in_ch, stem_ch1)            # stride 1
+        self.stem2 = nn.Sequential(nn.MaxPool2d(2), Conv2dReLU(stem_ch1, stem_ch2))  # stride 2
+
+        self.up5 = RobustDecoderBlock(in_ch=c[3], skip_ch=c[2],     out_ch=256)  # s32 -> s16
+        self.up4 = RobustDecoderBlock(in_ch=256,  skip_ch=c[1],     out_ch=128)  # s16 -> s8
+        self.up3 = RobustDecoderBlock(in_ch=128,  skip_ch=c[0],     out_ch=64)   # s8  -> s4
+        self.up2 = RobustDecoderBlock(in_ch=64,   skip_ch=stem_ch2, out_ch=32)   # s4  -> s2
+        self.up1 = RobustDecoderBlock(in_ch=32,   skip_ch=stem_ch1, out_ch=32)   # s2  -> s1
+
+        self.head = MultiTaskHead(32, 4)
+
+    def forward(self, images):
+        H, W = images.shape[2], images.shape[3]
+        pad_h = (32 - H % 32) % 32
+        pad_w = (32 - W % 32) % 32
+        x = F.pad(images, (0, pad_w, 0, pad_h), mode='reflect') if (pad_h or pad_w) else images
+
+        s1 = self.stem1(x)
+        s2 = self.stem2(s1)
+        f0, f1, f2, f3 = self.encoder.forward_intermediates(
+            x, indices=self._feat_indices, intermediates_only=True)
+
+        d = self.up5(f3, f2)
+        d = self.up4(d, f1)
+        d = self.up3(d, f0)
+        d = self.up2(d, s2)
+        d = self.up1(d, s1)
+
+        out = self.head(d)
+        return out[:, :, :H, :W]
+
+
+# ==============================================================================
 # FACTORY FUNCTION
 # ==============================================================================
 
 def get_model(config=None, model_type="transunet"):
     if model_type == "lightweight":
         return LightweightUNetPS(config)
-    elif model_type == "swin":      
-        return SwinUNetPS(config)
+    elif model_type in ("swin", "swin_real"):   # genuine Swin Transformer backbone
+        return SwinBackboneUNetPS(config)
+    elif model_type in ("globalattn", "global_attn"):  # CNN encoder + wide global-attention bottleneck
+        return GlobalAttnUNetPS(config)
     else:
         return TransUNetPS(config)

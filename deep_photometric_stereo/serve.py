@@ -26,17 +26,21 @@ from PIL import Image, ImageOps
 from config import Config, ModelConfig
 from model import get_model
 from utils import load_checkpoint, detect_model_type, count_parameters, normal_to_rgb
-from predict import predict_normal, normalize_images
+from predict import predict_at_native_scale, _srgb_to_linear
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 
 def _decode_image_bytes(data: bytes, filename: str) -> np.ndarray:
-    """Load any uploaded image to float32 RGB in [0,1].
+    """Load any uploaded image to float32 RGB in [0,1], in LINEAR space.
 
     Handles 16-bit linear TIFF (from the Android Camera2 RAW path) via tifffile
     so we keep full sensor precision; falls back to PIL for JPEG/PNG.
+
+    JPEG/PNG are gamma-encoded (sRGB), so they are converted to linear to match
+    the training distribution — the same sRGB->linear step the predict.py CLI
+    applies. RAW TIFF is already linear and is left untouched.
     """
     ext = os.path.splitext(filename or "")[1].lower()
     if ext in (".tif", ".tiff"):
@@ -46,17 +50,19 @@ def _decode_image_bytes(data: bytes, filename: str) -> np.ndarray:
         elif arr.ndim == 3 and arr.shape[2] > 3:
             arr = arr[:, :, :3]
         if arr.dtype == np.uint16:
-            return arr.astype(np.float32) / 65535.0
+            return arr.astype(np.float32) / 65535.0  # already linear
         if arr.dtype == np.uint8:
             return arr.astype(np.float32) / 255.0
         return arr.astype(np.float32) / float(np.iinfo(arr.dtype).max)
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-    return np.array(img).astype(np.float32) / 255.0
+    arr = np.array(img).astype(np.float32) / 255.0
+    return _srgb_to_linear(arr)  # gamma-encoded JPEG/PNG -> linear
 
 
 _model = None
 _device = None
 _save_dir = None   # set at startup; None = no saving
+_no_pred_mask = False  # set at startup; True = Otsu/dark-ref only, skip model seg head
 
 
 def _save_request(raw_image_bytes_list: list[bytes], filenames: list[str], pred_normal: np.ndarray):
@@ -98,12 +104,18 @@ def load_model(checkpoint_path, device_str="auto"):
     print(f"Device: {_device}")
 
 
-def predict_from_images(image_arrays, dark_array=None, tile_size=512, max_images=96):
+def predict_from_images(image_arrays, dark_array=None, tile_size=512, max_images=96,
+                        resize_max=1024, no_pred_mask=None):
+    # image_arrays: list of (H, W, 3) linear RGB. A single RGB upload becomes a
+    # (1, H, W, 3) stack which predict_normal unpacks into 3 PS channels.
+    # no_pred_mask defaults to the server-wide --mask choice set at startup.
+    if no_pred_mask is None:
+        no_pred_mask = _no_pred_mask
     images = np.stack(image_arrays, axis=0)
-    pred = predict_normal(
+    pred = predict_at_native_scale(
         _model, images, _device,
-        tile_size=tile_size, max_images=max_images,
         dark_frame=dark_array,
+        tile_size=tile_size, no_pred_mask=no_pred_mask, resize_max=resize_max,
     )
     return pred
 
@@ -310,9 +322,17 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--save_dir", type=str, default="./captures",
                         help="Directory to save each request's input and output (default: ./captures). Pass empty string to disable.")
+    parser.add_argument("--mask", type=str, default="model", choices=["model", "otsu"],
+                        help="Foreground masking method. 'model' (default): Otsu/dark-ref seed "
+                             "grown through the model's segmentation head. 'otsu': Otsu/dark-ref "
+                             "brightness seed only, no segmentation head (use for legacy checkpoints "
+                             "whose seg head is unreliable).")
     args = parser.parse_args()
 
-    global _save_dir
+    global _save_dir, _no_pred_mask
+    _no_pred_mask = (args.mask == "otsu")
+    print(f"Masking: {args.mask}"
+          + (" (Otsu/dark-ref seed only)" if _no_pred_mask else " (Otsu/dark-ref seed + seg-head grow)"))
     if args.save_dir:
         _save_dir = args.save_dir
         os.makedirs(_save_dir, exist_ok=True)

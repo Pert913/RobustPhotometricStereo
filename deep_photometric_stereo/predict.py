@@ -718,7 +718,7 @@ def main():
                         help="Overlap ratio (default: 0.75 for smooth blend)")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--model_type", type=str, default="auto",
-                        choices=["auto", "transunet", "lightweight", "swin"],
+                        choices=["auto", "transunet", "lightweight", "swin", "globalattn"],
                         help="Model architecture (auto-detected from checkpoint by default)")
     parser.add_argument("--no_pred_mask", action="store_true",
                         help="Ignore the model's predicted mask head and use the "

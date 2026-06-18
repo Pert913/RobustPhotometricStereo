@@ -378,6 +378,8 @@ class DiLiGentDataset(Dataset):
                 channels.append(img_gray[y:y+ps, x:x+ps])
             img_patch_rgb = np.stack(channels, axis=0)
 
+        img_patch_rgb = img_patch_rgb.astype(np.float32, copy=False)
+
         # Random gamma applied in raw-intensity space, before z-score. Negatives
         # (from dark-noise) are clipped to 0 so the power is well-defined.
         if self.augment and self.gamma_min < self.gamma_max:
@@ -521,12 +523,19 @@ class DiLiGentMVTestDataset(Dataset):
     Each sample is one (object, view) pair.
     """
 
-    def __init__(self, mv_root: str, objects: list = None, views_per_object: int = None):
+    def __init__(self, mv_root: str, objects: list = None, views_per_object: int = None,
+                 use_ring_aggregation: bool = True, ring_tilt_deg: float = 30.0):
         """
         Args:
             mv_root: path to mvpmsData directory
             objects: list of object names (e.g. ['bearPNG', 'cowPNG']); None = all
             views_per_object: max views to use per object (None = all)
+            use_ring_aggregation: match all available LEDs to the 24 canonical ring
+                directions and sum 8 per R/G/B arc into 3 channels (uniform b=1),
+                mirroring the ring-mixing training distribution. When False (or when
+                light_directions.txt is missing / <24 images), falls back to the
+                legacy 3-max-spread single-LED sampling.
+            ring_tilt_deg: canonical ring tilt used for LED matching.
         """
         try:
             import scipy.io as sio
@@ -535,6 +544,9 @@ class DiLiGentMVTestDataset(Dataset):
             raise ImportError("scipy is required for DiLiGenT-MV: pip install scipy")
 
         self.mv_root = mv_root
+        self.use_ring_aggregation = use_ring_aggregation
+        self.ring_tilt_deg = ring_tilt_deg
+        self._canonical = _canonical_led_directions(ring_tilt_deg) if use_ring_aggregation else None
         self.samples = []  # list of (obj_name, view_name, view_dir)
 
         all_objects = sorted(os.listdir(mv_root)) if objects is None else objects
@@ -555,7 +567,8 @@ class DiLiGentMVTestDataset(Dataset):
                 if os.path.exists(mat_path) and os.path.exists(mask_path):
                     self.samples.append((obj, view, view_path))
 
-        print(f"DiLiGentMVTestDataset: {len(self.samples)} view samples across {len(all_objects)} objects")
+        mode = "RingAgg-24" if use_ring_aggregation else "3-max-spread"
+        print(f"DiLiGentMVTestDataset: {len(self.samples)} view samples across {len(all_objects)} objects, {mode}")
 
     def __len__(self):
         return len(self.samples)
@@ -586,21 +599,40 @@ class DiLiGentMVTestDataset(Dataset):
             if os.path.basename(p)[0].isdigit()
         )
 
-        # Select the 3 images whose light directions are most spread apart
         light_dirs_path = os.path.join(view_dir, "light_directions.txt")
         dirs = self._load_light_dirs(light_dirs_path)
-        if dirs is not None:
-            indices = _max_spread_indices(dirs)
+
+        if self.use_ring_aggregation and dirs is not None and len(all_pngs) >= 24:
+            # Ring aggregation: match every available LED to the 24 canonical ring
+            # directions, then sum 8 LEDs per R/G/B arc into 3 channels with uniform
+            # weight (b=1). This mirrors the ring-mixing training distribution; the
+            # per-channel z-score below absorbs the resulting scale difference.
+            ring_indices = _match_canonical(dirs, self._canonical)  # (24,) into all_pngs
+            unique_idx = sorted(set(int(i) for i in ring_indices))
+            cache = {}
+            for gi in unique_idx:
+                cache[gi] = np.array(
+                    Image.open(all_pngs[gi]).convert("L")
+                ).astype(np.float32) / 255.0
+            H0, W0 = next(iter(cache.values())).shape
+            test_img_rgb = np.zeros((3, H0, W0), dtype=np.float32)
+            for c in range(3):
+                for i in range(8):
+                    gi = int(ring_indices[c * 8 + i])
+                    test_img_rgb[c] += cache[gi]
         else:
-            step = max(1, len(all_pngs) // 3)
-            indices = [0, step, 2 * step]
+            # Legacy: 3 single LEDs whose directions are most spread apart.
+            if dirs is not None:
+                indices = _max_spread_indices(dirs)
+            else:
+                step = max(1, len(all_pngs) // 3)
+                indices = [0, step, 2 * step]
 
-        channels = []
-        for i in indices:
-            img = np.array(Image.open(all_pngs[i]).convert("L")).astype(np.float32) / 255.0
-            channels.append(img)
-
-        test_img_rgb = np.stack(channels, axis=0)  # (3, H, W)
+            channels = []
+            for i in indices:
+                img = np.array(Image.open(all_pngs[i]).convert("L")).astype(np.float32) / 255.0
+                channels.append(img)
+            test_img_rgb = np.stack(channels, axis=0)  # (3, H, W)
 
         # Per-channel z-score normalisation on foreground pixels
         mask_bool = mask > 0.5
@@ -799,6 +831,7 @@ class SyntheticDataset(Dataset):
                         input_patch = (object_lights_rgb * mask_expanded) + (env_rgb * (1.0 - mask_expanded))
                     else:
                         input_patch = object_lights_rgb * mask_expanded
+                    input_patch = input_patch.astype(np.float32, copy=False)
                 else:
                     sampled_indices = random.sample(pl_indices, 3)
                     channels = []
@@ -817,6 +850,7 @@ class SyntheticDataset(Dataset):
                     patch_e = img_e[y:y+ps, x:x+ps] / (mean_ienv + 1e-8)
                     patch_e_rgb = patch_e[:, :, ::-1].transpose(2, 0, 1)
                     input_patch = (object_3_lights_rgb * mask_expanded) + (patch_e_rgb * (1.0 - mask_expanded))
+                    input_patch = input_patch.astype(np.float32, copy=False)
 
                 # Random gamma in raw-intensity space, before clip + z-score.
                 if self.augment and self.gamma_min < self.gamma_max:

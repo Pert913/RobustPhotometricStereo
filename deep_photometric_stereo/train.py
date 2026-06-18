@@ -3,7 +3,7 @@ Training script for UNetPS — Uncalibrated Photometric Stereo.
 
 Usage:
     # 1. Joint Pipeline (Train on Synthetic + DiLiGenT, evaluate every 5 epochs)
-    python train.py --mode joint_888 --json_path data/synthetic/train.json \
+    python train.py --mode joint_multitask --json_path data/synthetic/train.json \
                     --val_json data/synthetic/val_split.json \
                     --data_root data/training --epochs 200
 
@@ -175,7 +175,7 @@ def evaluate_diligent_holdout(model, test_dataset, device):
 # PIPELINE 1: JOINT PIPELINE (SYNTHETIC + DILIGENT)
 # =====================================================================
 
-def train_joint_888_pipeline(config, args):
+def train_joint_multitask_pipeline(config, args):
     """Main training pipeline for joint dataset (Synthetic + DiLiGenT)."""
     device = config.resolve_device()
     print(f"\n{'='*60}")
@@ -214,7 +214,7 @@ def train_joint_888_pipeline(config, args):
         gamma_min=config.data.gamma_min,
         gamma_max=config.data.gamma_max,
     )
-    
+
     combined_dataset = ConcatDataset([synth_train, diligent_train])
     train_loader = DataLoader(combined_dataset, batch_size=args.batch_size, shuffle=True, 
                               num_workers=args.num_workers, drop_last=True)
@@ -236,7 +236,7 @@ def train_joint_888_pipeline(config, args):
     # Wrap with MultiTaskLoss, assigning weight to segmentation task (e.g., 0.5)
     criterion = MultiTaskLoss(normal_loss_module=normal_criterion, seg_weight=0.5).to(device)
 
-    save_dir = os.path.join(args.save_dir, "joint_888_run")
+    save_dir = os.path.join(args.save_dir, "joint_multitask_run")
     os.makedirs(save_dir, exist_ok=True)
     csv_path = os.path.join(save_dir, "training_log.csv")
     
@@ -245,7 +245,20 @@ def train_joint_888_pipeline(config, args):
     history_seg_loss = []
     history_mae = []
     mae_epochs = []
-    
+
+    # Resume: load weights from a previous checkpoint to continue training
+    # (e.g. fine-tuning with background augmentation from best_joint.pt). Loads
+    # MODEL WEIGHTS ONLY — a fresh AdamW + cosine schedule starts from args.lr, so
+    # use a low --lr for fine-tuning to protect the converged normal head.
+    # NOTE: best_mae stays inf so this run always saves its best epoch. The val
+    # metric only tracks NORMAL MAE (not seg/IoU), so don't gate saving on it when
+    # the goal is a seg-head fix. Point --save_dir at a NEW folder so the original
+    # best_joint.pt is never overwritten.
+    if args.resume:
+        resumed_epoch, resumed_val = load_checkpoint(args.resume, model)
+        print(f"[*] RESUMED weights from {args.resume} (epoch={resumed_epoch}, val={resumed_val:.4f}). "
+              f"Fresh optimizer at lr={args.lr:.1e}; saving best-of-run to {save_dir}/")
+
     # Load previous CSV log to resume plotting history
     if os.path.exists(csv_path):
         with open(csv_path, mode='r', encoding='utf-8') as f:
@@ -298,7 +311,7 @@ def train_joint_888_pipeline(config, args):
         if epoch % 5 == 0 or epoch == args.epochs:
             val_mae = evaluate_and_save_top3(model, synth_test, epoch, save_dir, device)
             evaluate_diligent_holdout(model, diligent_test, device)
-            
+
             history_mae.append(val_mae)
             mae_epochs.append(epoch)
             val_mae_str = f"{val_mae:.4f}"
@@ -541,9 +554,9 @@ def train_synapse(config, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train TransUNetPS")
-    parser.add_argument("--mode", type=str, default="joint_888",
-                        choices=["train", "logo_cv", "synapse", "joint_888", "synthetic"],
-                        help="Training mode: train, logo_cv, synapse, or joint_888")
+    parser.add_argument("--mode", type=str, default="joint_multitask",
+                        choices=["train", "logo_cv", "synapse", "joint_multitask", "synthetic"],
+                        help="Training mode: train, logo_cv, synapse, or joint_multitask")
     parser.add_argument("--data_root", type=str, default="./data/training")
     parser.add_argument("--synapse_root", type=str, default="./data/Synapse")
     parser.add_argument("--json_path", type=str, default="data/synthetic/train.json")
@@ -561,7 +574,7 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--model_type", type=str, default="lightweight",
-                        choices=["transunet", "lightweight", "swin"])
+                        choices=["transunet", "lightweight", "swin", "globalattn"])
     parser.add_argument("--optimizer", type=str, default="adamw",
                         choices=["adamw", "sgd"])
     # Ring-mixing strategy knobs (override config.DataConfig defaults at CLI).
@@ -616,8 +629,8 @@ def main():
         if args.gamma_max is not None:
             config.data.gamma_max = args.gamma_max
 
-        if args.mode in ["joint_888", "synthetic"]:
-            train_joint_888_pipeline(config, args)
+        if args.mode in ["joint_multitask", "synthetic"]:
+            train_joint_multitask_pipeline(config, args)
         elif args.mode == "logo_cv":
             logo_cv(config)
         elif args.mode == "train":

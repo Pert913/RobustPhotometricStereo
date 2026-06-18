@@ -153,16 +153,36 @@ def load_checkpoint(path, model, optimizer=None):
     return epoch, val_loss
 
 def detect_model_type(path):
-    """Detect model_type from a checkpoint file. Returns 'transunet' or 'lightweight'."""
+    """Detect model_type from a checkpoint file.
+
+    Returns 'transunet', 'lightweight', 'globalattn' (CNN encoder + wide
+    global-attention bottleneck), or 'swin' (genuine Swin Transformer backbone).
+
+    The state_dict structure is checked first for the two attention models because
+    'swin' is historically ambiguous: legacy checkpoints saved the global-attention
+    model under model_type='swin', so the saved string alone cannot be trusted.
+    """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Check saved model_type field
+    keys = list(ckpt.get("model_state_dict", {}).keys())
+
+    # 1) Structural detection (ground truth, disambiguates the legacy 'swin' label)
+    if any(k.startswith("stem1.") for k in keys) and any(k.startswith("encoder.layers.") for k in keys):
+        return "swin"          # genuine Swin backbone (SwinBackboneUNetPS)
+    if any(k.startswith("patch_proj.") for k in keys) and any(k.startswith("pos_row.") for k in keys):
+        return "globalattn"    # global-attention bottleneck (formerly mislabelled 'swin')
+
+    # 2) Saved model_type field
     saved = ckpt.get("model_type", "")
+    if "SwinBackbone" in saved or saved == "swin" or saved == "swin_real":
+        return "swin"
+    if "GlobalAttn" in saved or "SwinUNetPS" in saved or saved == "globalattn":
+        return "globalattn"
     if "Lightweight" in saved or saved == "lightweight":
         return "lightweight"
     if "TransUNet" in saved or saved == "transunet":
         return "transunet"
-    # Fallback: detect from state_dict keys
-    keys = list(ckpt.get("model_state_dict", {}).keys())
+
+    # 3) Remaining structural fallbacks
     if any(k.startswith("enc1.") for k in keys):
         return "lightweight"
     if any(k.startswith("encoder.enc1.") for k in keys):

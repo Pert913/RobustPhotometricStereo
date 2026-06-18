@@ -1,5 +1,5 @@
 """
-Evaluation script for TransUNetPS / LightweightUNetPS / SwinUNetPS.
+Evaluation script for TransUNetPS / LightweightUNetPS / GlobalAttnUNetPS / SwinBackboneUNetPS.
 Multi-Task: Normal Estimation (MAE) + Segmentation (IoU).
 
 Reports MAE (lower=better) and seg IoU (higher=better). Needs GROUND-TRUTH
@@ -43,7 +43,7 @@ NEEDS THE FULL DATASETS (Tue's machine)
 
 --------------------------------------------------------------------------------
 Useful flags
-    --model_type auto|transunet|lightweight|swin   force arch (else from filename)
+    --model_type auto|transunet|lightweight|swin|globalattn   force arch (else from filename)
     --no_pred_mask        score against GT mask instead of the predicted mask
     --max_inference_side N downscale long side to N before tiling (large images)
     --save_output DIR     dump pred_normal.png / gt_normal.png / error_map.png
@@ -307,7 +307,7 @@ def main():
     
     # [NEW]: Model Type Override parameter
     parser.add_argument("--model_type", type=str, default="auto",
-                        choices=["auto", "transunet", "lightweight", "swin"],
+                        choices=["auto", "transunet", "lightweight", "swin", "globalattn"],
                         help="Force specific model architecture (overrides auto-detect from filename)")
     
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory for LOGO mode checkpoints")
