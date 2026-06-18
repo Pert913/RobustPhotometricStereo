@@ -106,8 +106,34 @@ def load_images(input_dir=None, image_paths=None, max_images=96, linearize="auto
     if len(paths) == 1:
         p = paths[0]
         ext = os.path.splitext(p)[1].lower()
-        if ext not in (".exr", ".tif", ".tiff"):
-            # Standard image format
+        if ext in (".tif", ".tiff"):
+            # Single RGB TIFF = a linear RAW capture (e.g. the LightControl app's
+            # Bayer->linear output, whose R/G/B channels carry the three
+            # illumination arcs). Use it directly for RGB Multiplexing.
+            # IMPORTANT: do NOT apply sRGB->linear here. RAW TIFF is already
+            # linear, matching the linear training distribution; a second
+            # de-gamma would distort the tonal curve. (The model z-scores its
+            # input, which is invariant to scale/offset but NOT to gamma, so the
+            # linear-vs-sRGB distinction genuinely changes the prediction.)
+            try:
+                import tifffile
+                arr = tifffile.imread(p).astype(np.float32)
+            except ImportError:
+                arr = np.array(Image.open(p)).astype(np.float32)
+            if arr.ndim == 3 and arr.shape[2] >= 3:
+                arr = arr[:, :, :3]
+                if arr.max() > 255.0:
+                    arr = arr / 65535.0
+                elif arr.max() > 1.5:
+                    arr = arr / 255.0
+                print("[*] Detected single RGB TIFF (linear RAW)! Enabling RGB Multiplexing Mode "
+                      "(R,G,B -> 3 light angles; no sRGB->linear, already linear)")
+                images = np.stack([arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]], axis=0)
+                print(f"  Extracted 3 channels from single image. Shape: {images.shape}, dtype: {images.dtype}")
+                return images
+            # single-channel TIFF -> fall through to standard sequence handling below
+        elif ext != ".exr":
+            # Standard 8-bit image format (PNG/JPEG/BMP)
             img_pil = ImageOps.exif_transpose(Image.open(p))  # honour phone camera rotation
             if img_pil.mode in ("RGB", "RGBA"):
                 print("[*] Detected single RGB image! Enabling RGB Multiplexing Mode (R,G,B -> 3 light angles)")
@@ -503,6 +529,69 @@ def predict_normal(model, images, device, tile_size=512, overlap=0.75, max_image
     # ==============================================================
 
     return pred_normal.transpose(1, 2, 0)
+
+
+def predict_at_native_scale(model, images, device, dark_frame=None, tile_size=512,
+                            overlap=0.75, max_images=96, no_pred_mask=False,
+                            resize_max=1024, single_pass="auto"):
+    """
+    Normal-map prediction with CLI-equivalent scale matching, used by serve.py.
+
+    If the longest side exceeds ``resize_max``, the image stack (and the optional
+    dark frame) is downscaled to the training scale, the prediction is run, and
+    the normal map is upscaled back to the native resolution and re-normalized to
+    unit vectors. Mirrors run_normal_prediction so the REST server and the CLI
+    produce matching results.
+
+    images : (N, H, W), (N, H, W, 3), (1, H, W, 3) or (H, W, 3) float array.
+    Returns: (H, W, 3) float32 normal map.
+    """
+    arr = np.asarray(images, dtype=np.float32)
+
+    # Locate the spatial (H, W) axes for both stacked-grayscale and RGB layouts.
+    if arr.ndim == 3 and arr.shape[2] in (3, 4) and arr.shape[2] < arr.shape[0]:
+        orig_h, orig_w = arr.shape[0], arr.shape[1]     # (H, W, C)
+    else:                                               # (N, H, W) or (N, H, W, C)
+        orig_h, orig_w = arr.shape[1], arr.shape[2]
+
+    def _resize_spatial(a, nh, nw):
+        t = torch.from_numpy(np.asarray(a, dtype=np.float32))
+        if a.ndim == 4:                                              # (N, H, W, C)
+            t = F.interpolate(t.permute(0, 3, 1, 2), size=(nh, nw), mode="area")
+            return t.permute(0, 2, 3, 1).numpy()
+        if a.ndim == 3 and a.shape[2] in (3, 4) and a.shape[2] < a.shape[0]:  # (H, W, C)
+            t = F.interpolate(t.permute(2, 0, 1).unsqueeze(0), size=(nh, nw), mode="area")
+            return t[0].permute(1, 2, 0).numpy()
+        if a.ndim == 3:                                             # (N, H, W)
+            return F.interpolate(t.unsqueeze(0), size=(nh, nw), mode="area")[0].numpy()
+        return F.interpolate(t.unsqueeze(0).unsqueeze(0), size=(nh, nw), mode="area")[0, 0].numpy()  # (H, W)
+
+    scaled = False
+    if resize_max and max(orig_h, orig_w) > resize_max:
+        scale = resize_max / max(orig_h, orig_w)
+        new_h, new_w = int(round(orig_h * scale)), int(round(orig_w * scale))
+        arr = _resize_spatial(arr, new_h, new_w)
+        if dark_frame is not None:
+            dark_frame = _resize_spatial(np.asarray(dark_frame, dtype=np.float32), new_h, new_w)
+        scaled = True
+        print(f"[*] Downscaled {orig_h}x{orig_w} -> {new_h}x{new_w} to match training scale "
+              f"(disable with resize_max=0)")
+
+    pred_normal = predict_normal(
+        model, arr, device, tile_size=tile_size, overlap=overlap, max_images=max_images,
+        dark_frame=dark_frame, no_pred_mask=no_pred_mask, single_pass=single_pass,
+    )
+
+    if scaled:
+        t_pn = torch.from_numpy(pred_normal.transpose(2, 0, 1)).unsqueeze(0)
+        t_pn = F.interpolate(t_pn, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        pred_normal = t_pn[0].numpy().transpose(1, 2, 0)
+        norms = np.linalg.norm(pred_normal, axis=2, keepdims=True)
+        pred_normal = np.where(norms > 0.1, pred_normal / (norms + 1e-8), 0.0).astype(np.float32)
+        print(f"[*] Upscaled normal map back to {orig_h}x{orig_w}")
+
+    return pred_normal
+
 
 def run_normal_prediction(args, device):
     """Run photometric stereo prediction."""
